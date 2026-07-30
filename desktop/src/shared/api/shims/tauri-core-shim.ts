@@ -294,10 +294,9 @@ export async function invoke<T = unknown>(
       return (await hostIpc("get_users_batch", args)) as T;
 
     case "search_users":
-      return {
-        users: [],
-        next_cursor: null,
-      } as unknown as T;
+    case "search_messages":
+    case "get_presence":
+      return (await hostIpc(cmd, args)) as T;
 
     // Settings → Agents defaults. Must hit host so preferred_runtime (e.g. grok)
     // persists across refresh — never hardcode pi-coding-agent.
@@ -452,10 +451,9 @@ export async function invoke<T = unknown>(
     }
 
     case "get_canvas":
-      return null as unknown as T;
-
     case "set_canvas":
-      return true as unknown as T;
+    case "get_feed":
+      return (await hostIpc(cmd, args)) as T;
 
     // Workflows / voice out of scope
     case "get_channel_workflows":
@@ -464,23 +462,6 @@ export async function invoke<T = unknown>(
     case "get_workflow_runs":
     case "get_run_approvals":
       return [] as unknown as T;
-
-    case "get_feed":
-      return {
-        feed: {
-          mentions: [],
-          needs_action: [],
-          needsAction: [],
-          activity: [],
-          agent_activity: [],
-          agentActivity: [],
-        },
-        meta: {
-          since: 0,
-          total: 0,
-          generatedAt: Date.now(),
-        },
-      } as unknown as T;
 
     case "list_managed_agents":
     case "get_managed_agents":
@@ -526,17 +507,22 @@ export async function invoke<T = unknown>(
     }
 
     case "list_teams":
+    case "create_team":
+    case "update_team":
+    case "delete_team":
+      return (await hostIpc(cmd, args)) as T;
+
+    // Not used on web host product path (or no desktop store equivalent yet).
     case "list_projects":
     case "list_community_members":
     case "list_custom_emojis":
       return [] as unknown as T;
 
     case "resolve_oa_owner":
-      return null as unknown as T;
-
     case "archive_identity":
     case "unarchive_identity":
-      return true as unknown as T;
+    case "get_agent_memory":
+      return (await hostIpc(cmd, args)) as T;
 
     case "discover_acp_auth_methods":
       return { methods: [] } as unknown as T;
@@ -558,14 +544,6 @@ export async function invoke<T = unknown>(
     case "list_managed_agent_runtimes":
     case "list_save_subscriptions":
       return [] as unknown as T;
-
-    case "get_agent_memory":
-      return {
-        core: null,
-        memories: [],
-        truncated: false,
-        fetchedAt: Math.floor(Date.now() / 1000),
-      } as unknown as T;
 
     case "get_huddle_state":
       return null as unknown as T;

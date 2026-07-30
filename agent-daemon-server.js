@@ -3644,16 +3644,753 @@ function ipcDiscoverGitBashPrerequisite() {
   return null;
 }
 
+// ── Teams (file-backed, desktop agents/teams.json parity) ───────────────────
+
+const TEAMS_JSON_PATH =
+  process.env.BUZZ_WEB_TEAMS_FILE || path.join(WEB_CONFIG_DIR, "teams.json");
+
+function loadTeams() {
+  const stored = readJsonFile(TEAMS_JSON_PATH, []);
+  return Array.isArray(stored) ? stored : [];
+}
+
+function saveTeams(list) {
+  writeJsonFile(TEAMS_JSON_PATH, list);
+}
+
+function ipcListTeams() {
+  return loadTeams();
+}
+
+function ipcCreateTeam(args) {
+  const input = args.input || args;
+  const name = String(input.name || "").trim();
+  if (!name) throw new Error("Team name is required");
+  const now = isoNow();
+  const personaIds = Array.isArray(input.personaIds || input.persona_ids)
+    ? input.personaIds || input.persona_ids
+    : [];
+  const team = {
+    id: crypto.randomUUID(),
+    name,
+    description:
+      input.description === undefined || input.description === null
+        ? null
+        : String(input.description),
+    instructions:
+      input.instructions === undefined || input.instructions === null
+        ? null
+        : String(input.instructions),
+    persona_ids: personaIds,
+    is_builtin: false,
+    source_dir: null,
+    is_symlink: false,
+    symlink_target: null,
+    version: null,
+    created_at: now,
+    updated_at: now,
+  };
+  const teams = loadTeams();
+  teams.push(team);
+  saveTeams(teams);
+  return team;
+}
+
+function ipcUpdateTeam(args) {
+  const input = args.input || args;
+  const id = String(input.id || "").trim();
+  if (!id) throw new Error("id required");
+  const teams = loadTeams();
+  const idx = teams.findIndex((t) => t.id === id);
+  if (idx < 0) throw new Error(`team not found: ${id}`);
+  const existing = teams[idx];
+  if (existing.is_builtin) throw new Error("cannot update built-in team");
+  const next = { ...existing, updated_at: isoNow() };
+  if (input.name != null) next.name = String(input.name).trim();
+  if (input.description !== undefined) {
+    next.description =
+      input.description === null ? null : String(input.description);
+  }
+  if (input.instructions !== undefined) {
+    next.instructions =
+      input.instructions === null ? null : String(input.instructions);
+  }
+  if (input.personaIds !== undefined || input.persona_ids !== undefined) {
+    next.persona_ids = input.personaIds ?? input.persona_ids ?? [];
+  }
+  teams[idx] = next;
+  saveTeams(teams);
+  return next;
+}
+
+function ipcDeleteTeam(args) {
+  const id = String(args.id || args.input?.id || "").trim();
+  if (!id) throw new Error("id required");
+  const teams = loadTeams();
+  const existing = teams.find((t) => t.id === id);
+  if (!existing) throw new Error(`team not found: ${id}`);
+  if (existing.is_builtin) throw new Error("cannot delete built-in team");
+  saveTeams(teams.filter((t) => t.id !== id));
+  return true;
+}
+
+// ── Home feed / search / canvas / presence (relay-backed) ───────────────────
+
+const FEED_MENTION_KINDS = [
+  9, 40002, 1, 45001, 45003, 1617, 1618, 1621, 1630, 1631, 1632, 1633,
+];
+const FEED_APPROVAL_KINDS = [46010, 46011, 46012];
+const SEARCH_MESSAGE_KINDS = [9, 40002, 45001, 45003];
+const ENGRAM_KIND = 30174;
+const ENGRAM_FETCH_LIMIT = 5000;
+const ENGRAM_D_TAG_DOMAIN = Buffer.from("agent-memory/v1/d-tag");
+
+function channelIdFromTags(ev) {
+  return tagValue(ev, "h");
+}
+
+function feedItemFromEvent(ev, category) {
+  return {
+    id: ev.id,
+    kind: ev.kind,
+    pubkey: ev.pubkey,
+    content: typeof ev.content === "string" ? ev.content : "",
+    created_at: ev.created_at || 0,
+    channel_id: channelIdFromTags(ev),
+    channel_name: "",
+    channel_type: null,
+    tags: Array.isArray(ev.tags) ? ev.tags : [],
+    category,
+  };
+}
+
+function typesWant(types, name) {
+  if (types == null || types === "") return true;
+  return String(types)
+    .split(",")
+    .map((s) => s.trim())
+    .includes(name);
+}
+
+async function ipcGetFeed(args = {}) {
+  const since = args.since != null ? Number(args.since) : null;
+  const cap = Math.min(Number(args.limit) || 50, 100);
+  const types = args.types;
+  const myPk = hostPubkey();
+
+  const mentionFilter = {
+    kinds: FEED_MENTION_KINDS,
+    "#p": [myPk],
+    limit: cap,
+  };
+  const approvalFilter = {
+    kinds: FEED_APPROVAL_KINDS,
+    "#p": [myPk],
+    limit: 20,
+  };
+  if (Number.isFinite(since) && since != null) {
+    mentionFilter.since = since;
+    approvalFilter.since = since;
+  }
+
+  let mentions = [];
+  let needsAction = [];
+  try {
+    if (typesWant(types, "mentions")) {
+      const events = await queryRelay([mentionFilter]);
+      mentions = events.map((ev) => feedItemFromEvent(ev, "mentions"));
+    }
+  } catch (err) {
+    console.warn("get_feed mentions failed:", err.message);
+  }
+  try {
+    if (typesWant(types, "needs_action")) {
+      const events = await queryRelay([approvalFilter]);
+      needsAction = events.map((ev) => feedItemFromEvent(ev, "needs_action"));
+    }
+  } catch (err) {
+    console.warn("get_feed needs_action failed:", err.message);
+  }
+
+  return {
+    feed: {
+      mentions,
+      needs_action: needsAction,
+      activity: [],
+      agent_activity: [],
+    },
+    meta: {
+      since: Number.isFinite(since) && since != null ? since : 0,
+      total: mentions.length + needsAction.length,
+      generated_at: Math.floor(Date.now() / 1000),
+    },
+  };
+}
+
+function userSearchResultFromEvent(ev) {
+  const p = profileFromKind0(ev);
+  return {
+    pubkey: (ev.pubkey || "").toLowerCase(),
+    display_name: p.display_name,
+    avatar_url: p.avatar_url,
+    nip05_handle: p.nip05_handle,
+    owner_pubkey: p.owner_pubkey,
+    is_agent: Boolean(p.owner_pubkey),
+  };
+}
+
+function matchScoreUser(q, display, nip05, pubkey) {
+  const d = (display || "").toLowerCase();
+  const n = (nip05 || "").toLowerCase();
+  const pk = (pubkey || "").toLowerCase();
+  if (!q) return 0;
+  if (d === q) return 1000;
+  if (d.startsWith(q)) return 800;
+  if (d.includes(q)) return 600;
+  if (n === q) return 500;
+  if (n.startsWith(q)) return 400;
+  if (n.includes(q)) return 300;
+  if (pk.startsWith(q)) return 200;
+  if (pk.includes(q)) return 100;
+  return 0;
+}
+
+async function ipcSearchUsers(args = {}) {
+  const query = String(args.query ?? args.q ?? "").trim();
+  const max = Math.min(Number(args.limit) || 8, 500);
+  const page =
+    args.cursor != null && String(args.cursor).trim() !== ""
+      ? Math.max(1, parseInt(String(args.cursor), 10) || 1)
+      : 1;
+
+  if (max === 0) return { users: [], next_cursor: null };
+
+  if (!query) {
+    const events = await queryRelay([
+      { kinds: [0], limit: max, page },
+    ]);
+    const byPk = new Map();
+    for (const ev of events) {
+      if (ev.kind !== 0) continue;
+      const info = userSearchResultFromEvent(ev);
+      const key = info.pubkey;
+      const prev = byPk.get(key);
+      if (!prev || (ev.created_at || 0) > (prev._ts || 0)) {
+        byPk.set(key, { ...info, _ts: ev.created_at || 0 });
+      }
+    }
+    let users = [...byPk.values()].map(({ _ts, ...u }) => u);
+    users.sort((a, b) => {
+      const la = (a.display_name || a.nip05_handle || a.pubkey).toLowerCase();
+      const lb = (b.display_name || b.nip05_handle || b.pubkey).toLowerCase();
+      return la < lb ? -1 : la > lb ? 1 : a.pubkey.localeCompare(b.pubkey);
+    });
+    users = users.slice(0, max);
+    return {
+      users,
+      next_cursor: events.length >= max ? String(page + 1) : null,
+    };
+  }
+
+  const q = query.toLowerCase();
+  const events = await queryRelay([
+    {
+      kinds: [0],
+      search: query,
+      search_mode: "prefix",
+      limit: max,
+      page,
+    },
+  ]);
+
+  const scored = [];
+  for (let idx = 0; idx < events.length; idx++) {
+    const ev = events[idx];
+    if (ev.kind !== 0) continue;
+    const info = userSearchResultFromEvent(ev);
+    const score = matchScoreUser(
+      q,
+      info.display_name,
+      info.nip05_handle,
+      info.pubkey,
+    );
+    if (score === 0) continue;
+    scored.push({ score, idx, info });
+  }
+  scored.sort((a, b) => b.score - a.score || a.idx - b.idx);
+  const seen = new Set();
+  const users = [];
+  for (const row of scored) {
+    if (seen.has(row.info.pubkey)) continue;
+    seen.add(row.info.pubkey);
+    users.push(row.info);
+    if (users.length >= max) break;
+  }
+  return {
+    users,
+    next_cursor: events.length >= max ? String(page + 1) : null,
+  };
+}
+
+async function ipcSearchMessages(args = {}) {
+  const q = String(args.q || args.query || "").trim();
+  const cap = Math.min(Number(args.limit) || 20, 100);
+  if (!q) return { hits: [], found: 0 };
+
+  const filter = {
+    kinds: SEARCH_MESSAGE_KINDS,
+    search: q,
+    search_mode: "prefix",
+    limit: cap,
+  };
+  const channelId = args.channelId || args.channel_id;
+  if (channelId) filter["#h"] = [channelId];
+  const authors = args.authors;
+  if (Array.isArray(authors) && authors.length) {
+    filter.authors = authors.map((a) => String(a).trim()).filter(Boolean);
+  }
+  if (args.since != null) filter.since = Number(args.since);
+  if (args.until != null) filter.until = Number(args.until);
+
+  const events = await queryRelay([filter]);
+  const total = events.length;
+  const hits = events.map((ev, idx) => ({
+    event_id: ev.id,
+    content: typeof ev.content === "string" ? ev.content : "",
+    kind: ev.kind,
+    pubkey: ev.pubkey,
+    channel_id: channelIdFromTags(ev),
+    channel_name: null,
+    created_at: ev.created_at || 0,
+    score: total <= 1 ? 1.0 : 1.0 - idx / total,
+  }));
+  return { hits, found: hits.length };
+}
+
+async function ipcGetCanvas(args = {}) {
+  const channelId = args.channelId || args.channel_id;
+  if (!channelId) throw new Error("channelId required");
+  const events = await queryRelay([
+    { kinds: [40100], "#h": [channelId], limit: 1 },
+  ]);
+  const event = events[0];
+  if (!event) {
+    return {
+      content: "",
+      event_id: null,
+      updated_at: null,
+      author: null,
+    };
+  }
+  return {
+    content: typeof event.content === "string" ? event.content : "",
+    event_id: event.id,
+    updated_at: event.created_at || null,
+    author: event.pubkey,
+  };
+}
+
+async function ipcSetCanvas(args = {}) {
+  const channelId = args.channelId || args.channel_id;
+  const content = args.content;
+  if (!channelId) throw new Error("channelId required");
+  if (typeof content !== "string") throw new Error("content required");
+  if (content.length > 64 * 1024) {
+    throw new Error(`content exceeds maximum size of ${64 * 1024} bytes`);
+  }
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 40100,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [["h", channelId]],
+      content,
+    },
+    sk,
+  );
+  await submitEvent(event);
+  return { ok: true, event_id: event.id };
+}
+
+async function ipcGetPresence(args = {}) {
+  const pubkeys = args.pubkeys || args.pubKeys || [];
+  const list = Array.isArray(pubkeys)
+    ? pubkeys.map((p) => String(p).trim().toLowerCase()).filter(Boolean)
+    : [];
+  if (!list.length) return {};
+
+  let events = [];
+  try {
+    events = await queryRelay([
+      { kinds: [20001], authors: list, limit: list.length * 2 },
+    ]);
+  } catch (err) {
+    console.warn("get_presence failed:", err.message);
+    return {};
+  }
+
+  const latest = new Map();
+  for (const ev of events) {
+    const pk =
+      (tagValue(ev, "p") || ev.pubkey || "").toLowerCase();
+    if (!pk) continue;
+    const ts = ev.created_at || 0;
+    const statusRaw = String(ev.content || "").trim();
+    let status = null;
+    if (statusRaw === "online" || statusRaw === "away" || statusRaw === "offline") {
+      status = statusRaw;
+    }
+    if (!status) continue;
+    const prev = latest.get(pk);
+    if (!prev || ts >= prev.ts) {
+      latest.set(pk, { ts, status });
+    }
+  }
+  const out = {};
+  for (const [pk, v] of latest) out[pk] = v.status;
+  return out;
+}
+
+// ── Identity archive (NIP-IA) ───────────────────────────────────────────────
+
+async function ipcArchiveIdentity(args = {}) {
+  const req = args.req || args.input || args;
+  const target = String(req.targetPubkey || req.target_pubkey || "")
+    .trim()
+    .toLowerCase();
+  if (!HEX64.test(target)) throw new Error("targetPubkey must be 64-hex");
+  const content = typeof req.content === "string" ? req.content : "";
+  const reason = req.reason != null ? String(req.reason) : null;
+  const replacedBy = req.replacedBy || req.replaced_by || null;
+  if (content.length > 64 * 1024) throw new Error("content too large");
+  if (reason && reason.length > 64) throw new Error("reason code too long");
+  if (replacedBy) {
+    const rb = String(replacedBy).trim().toLowerCase();
+    if (!HEX64.test(rb)) throw new Error("replacedBy must be 64-hex");
+    if (rb === target) throw new Error("replaced-by must differ from the target");
+  }
+
+  const tags = [["-"], ["p", target]];
+  if (reason) tags.push(["reason", reason]);
+  if (replacedBy) {
+    tags.push(["replaced-by", String(replacedBy).trim().toLowerCase()]);
+  }
+  // Owner-of-agent auth tag: only when we have a stored OA tag for this agent.
+  // Full NIP-OA verification needs buzz-sdk; self-archive needs no auth tag.
+  const me = hostPubkey().toLowerCase();
+  if (me !== target) {
+    try {
+      const authPath = path.join(WEB_CONFIG_DIR, "agent-oa-auth-tag.json");
+      if (fs.existsSync(authPath)) {
+        const auth = JSON.parse(fs.readFileSync(authPath, "utf8"));
+        if (
+          Array.isArray(auth) &&
+          auth[0] === "auth" &&
+          auth.length >= 4 &&
+          typeof auth[1] === "string" &&
+          auth[1].toLowerCase() === me
+        ) {
+          tags.push(["auth", auth[1], auth[2] || "", auth[3]]);
+        }
+      }
+    } catch (err) {
+      console.warn("archive_identity auth tag skip:", err.message);
+    }
+  }
+
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 9035,
+      created_at: Math.floor(Date.now() / 1000),
+      tags,
+      content,
+    },
+    sk,
+  );
+  const result = await submitEvent(event);
+  return result && typeof result === "object"
+    ? result
+    : { ok: true, event_id: event.id };
+}
+
+async function ipcUnarchiveIdentity(args = {}) {
+  const req = args.req || args.input || args;
+  const target = String(req.targetPubkey || req.target_pubkey || "")
+    .trim()
+    .toLowerCase();
+  if (!HEX64.test(target)) throw new Error("targetPubkey must be 64-hex");
+  const content = typeof req.content === "string" ? req.content : "";
+  const reason = req.reason != null ? String(req.reason) : null;
+  if (content.length > 64 * 1024) throw new Error("content too large");
+  if (reason && reason.length > 64) throw new Error("reason code too long");
+
+  const tags = [["-"], ["p", target]];
+  if (reason) tags.push(["reason", reason]);
+
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 9036,
+      created_at: Math.floor(Date.now() / 1000),
+      tags,
+      content,
+    },
+    sk,
+  );
+  const result = await submitEvent(event);
+  return result && typeof result === "object"
+    ? result
+    : { ok: true, event_id: event.id };
+}
+
+/**
+ * Best-effort NIP-OA owner resolution from kind:0 auth tag shape.
+ * Without full buzz-sdk verify we only surface the declared owner pubkey
+ * when the tag is structurally valid (auth, 64-hex owner, conditions, 128-hex sig).
+ */
+async function ipcResolveOaOwner(args = {}) {
+  const target = String(
+    args.targetPubkey || args.target_pubkey || args.pubkey || "",
+  )
+    .trim()
+    .toLowerCase();
+  if (!HEX64.test(target)) return null;
+  const events = await queryRelay([
+    { kinds: [0], authors: [target], limit: 1 },
+  ]);
+  const kind0 = events[0];
+  if (!kind0) return null;
+  for (const t of kind0.tags || []) {
+    if (
+      t[0] === "auth" &&
+      t.length >= 4 &&
+      typeof t[1] === "string" &&
+      HEX64.test(t[1]) &&
+      typeof t[3] === "string" &&
+      t[3].length === 128 &&
+      /^[0-9a-f]+$/i.test(t[3])
+    ) {
+      const owner = t[1].toLowerCase();
+      const me = hostPubkey().toLowerCase();
+      return { owner, is_me: owner === me };
+    }
+  }
+  return null;
+}
+
+// ── Agent memory (NIP-AE engrams, kind 30174) ───────────────────────────────
+
+function engramConversationKey(agentPubkeyHex) {
+  const sk = loadSecretKeyBytes();
+  return nip44.v2.utils.getConversationKey(sk, agentPubkeyHex.toLowerCase());
+}
+
+function engramDTag(conversationKey, slug) {
+  const mac = crypto.createHmac("sha256", Buffer.from(conversationKey));
+  mac.update(ENGRAM_D_TAG_DOMAIN);
+  mac.update(Buffer.from([0]));
+  mac.update(Buffer.from(slug, "utf8"));
+  return mac.digest("hex");
+}
+
+function extractOutgoingRefs(body) {
+  if (typeof body !== "string" || !body) return [];
+  const refs = [];
+  const re = /\[\[([^\]]+)\]\]/g;
+  let m;
+  while ((m = re.exec(body)) !== null) {
+    const slug = m[1].trim();
+    if (slug && !refs.includes(slug)) refs.push(slug);
+  }
+  return refs;
+}
+
+function parseEngramBody(plaintext) {
+  let obj;
+  try {
+    obj = JSON.parse(plaintext);
+  } catch {
+    return null;
+  }
+  if (!obj || typeof obj !== "object" || typeof obj.slug !== "string") {
+    return null;
+  }
+  const slug = obj.slug;
+  if (slug === "core") {
+    if (typeof obj.profile !== "string") return null;
+    return { kind: "core", slug: "core", body: obj.profile };
+  }
+  if (obj.value === null) {
+    return { kind: "tombstone", slug, body: null };
+  }
+  if (typeof obj.value !== "string") return null;
+  return { kind: "memory", slug, body: obj.value };
+}
+
+async function ipcGetAgentMemory(args = {}) {
+  const agentPubkey = String(
+    args.agentPubkey || args.agent_pubkey || "",
+  )
+    .trim()
+    .toLowerCase();
+  if (!HEX64.test(agentPubkey)) {
+    throw new Error("agent pubkey must be 64-hex");
+  }
+
+  const me = hostPubkey().toLowerCase();
+  const store = loadManagedAgentsStore();
+  const isManaged = (store.agents || []).some(
+    (a) => String(a.pubkey || "").toLowerCase() === agentPubkey,
+  );
+  let isDeclaredOwner = false;
+  if (!isManaged) {
+    try {
+      const kind0s = await queryRelay([
+        { kinds: [0], authors: [agentPubkey], limit: 1 },
+      ]);
+      const k0 = kind0s[0];
+      if (k0) {
+        for (const t of k0.tags || []) {
+          if (
+            t[0] === "auth" &&
+            typeof t[1] === "string" &&
+            t[1].toLowerCase() === me
+          ) {
+            isDeclaredOwner = true;
+            break;
+          }
+        }
+        // Also accept content-embedded owner fields used by some agents.
+        if (!isDeclaredOwner) {
+          const p = profileFromKind0(k0);
+          if (
+            p.owner_pubkey &&
+            String(p.owner_pubkey).toLowerCase() === me
+          ) {
+            isDeclaredOwner = true;
+          }
+        }
+      }
+    } catch (err) {
+      console.warn("get_agent_memory owner check:", err.message);
+    }
+  }
+  if (!isManaged && !isDeclaredOwner) {
+    throw new Error(
+      `not the owner of agent ${agentPubkey} (no managed-agent record and no verified NIP-OA owner declaration)`,
+    );
+  }
+
+  const events = await queryRelay([
+    {
+      kinds: [ENGRAM_KIND],
+      authors: [agentPubkey],
+      "#p": [me],
+      limit: ENGRAM_FETCH_LIMIT,
+    },
+  ]);
+  const truncated = events.length >= ENGRAM_FETCH_LIMIT;
+  const conversationKey = engramConversationKey(agentPubkey);
+
+  // Group by d-tag; keep LWW head (max created_at, then min id).
+  const byD = new Map();
+  for (const ev of events) {
+    if (typeof verifyEvent === "function") {
+      try {
+        if (!verifyEvent(ev)) continue;
+      } catch {
+        continue;
+      }
+    }
+    const d = tagValue(ev, "d");
+    if (!d || d.length !== 64) continue;
+    const pTag = tagValue(ev, "p");
+    if (!pTag || pTag.toLowerCase() !== me) continue;
+    if ((ev.pubkey || "").toLowerCase() !== agentPubkey) continue;
+
+    let plaintext;
+    try {
+      if (!contentLooksLikeNip44(ev.content)) continue;
+      plaintext = nip44.v2.decrypt(ev.content, conversationKey);
+    } catch {
+      continue;
+    }
+    const parsed = parseEngramBody(plaintext);
+    if (!parsed) continue;
+    // d-tag re-derivation check
+    try {
+      const derived = engramDTag(conversationKey, parsed.slug);
+      if (derived !== d) continue;
+    } catch {
+      continue;
+    }
+
+    const prev = byD.get(d);
+    if (
+      !prev ||
+      (ev.created_at || 0) > (prev.created_at || 0) ||
+      ((ev.created_at || 0) === (prev.created_at || 0) &&
+        String(ev.id) < String(prev.event_id))
+    ) {
+      byD.set(d, {
+        ...parsed,
+        event_id: ev.id,
+        created_at: ev.created_at || 0,
+      });
+    }
+  }
+
+  let core = null;
+  const memories = [];
+  for (const entry of byD.values()) {
+    if (entry.kind === "tombstone") continue;
+    const out = {
+      slug: entry.slug,
+      body: entry.body,
+      eventId: entry.event_id,
+      createdAt: entry.created_at,
+      outgoingRefs: extractOutgoingRefs(entry.body),
+    };
+    if (entry.kind === "core" || entry.slug === "core") {
+      core = out;
+    } else {
+      memories.push(out);
+    }
+  }
+  memories.sort((a, b) => (a.slug < b.slug ? -1 : a.slug > b.slug ? 1 : 0));
+
+  return {
+    core,
+    memories,
+    truncated,
+    fetchedAt: Math.floor(Date.now() / 1000),
+  };
+}
+
 // ── Models / signing (existing) ─────────────────────────────────────────────
 
 async function fetchFedoraModels() {
+  const env = getEnvConfig();
+  const base =
+    env.OPENAI_BASE_URL ||
+    env.BUZZ_MODELS_BASE_URL ||
+    process.env.OPENAI_BASE_URL ||
+    "http://10.127.127.15:8317/v1";
+  const modelsUrl = `${String(base).replace(/\/$/, "")}/models`;
+  const apiKey =
+    env.OPENAI_API_KEY ||
+    env.BUZZ_MODELS_API_KEY ||
+    process.env.OPENAI_API_KEY ||
+    process.env.BUZZ_MODELS_API_KEY ||
+    "";
   try {
-    const res = await fetch("http://10.127.127.15:8317/v1/models", {
-      headers: { Authorization: `Bearer ${process.env.OPENAI_API_KEY || process.env.BUZZ_MODELS_API_KEY || ""}` },
+    const res = await fetch(modelsUrl, {
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : {},
     });
     if (res.ok) {
       const json = await res.json();
-      if (Array.isArray(json.data)) {
+      if (Array.isArray(json.data) && json.data.length > 0) {
         return json.data.map((m) => ({
           id: m.id,
           name: m.id,
@@ -3954,6 +4691,42 @@ async function handleIpc(cmd, args = {}) {
       return ipcDecryptObserverEvent(args);
     case "build_observer_control_event":
       return ipcBuildObserverControlEvent(args);
+
+    // ── Home / search / canvas / presence ──
+    case "get_feed":
+      return await ipcGetFeed(args);
+    case "search_users":
+      return await ipcSearchUsers(args);
+    case "search_messages":
+      return await ipcSearchMessages(args);
+    case "get_canvas":
+      return await ipcGetCanvas(args);
+    case "set_canvas":
+      return await ipcSetCanvas(args);
+    case "get_presence":
+      return await ipcGetPresence(args);
+
+    // ── Identity archive (NIP-IA) ──
+    case "archive_identity":
+      return await ipcArchiveIdentity(args);
+    case "unarchive_identity":
+      return await ipcUnarchiveIdentity(args);
+    case "resolve_oa_owner":
+      return await ipcResolveOaOwner(args);
+
+    // ── Agent memory (NIP-AE) ──
+    case "get_agent_memory":
+      return await ipcGetAgentMemory(args);
+
+    // ── Teams (file-backed) ──
+    case "list_teams":
+      return ipcListTeams();
+    case "create_team":
+      return ipcCreateTeam(args);
+    case "update_team":
+      return ipcUpdateTeam(args);
+    case "delete_team":
+      return ipcDeleteTeam(args);
 
     case "get_profile":
     case "get_user_profile":
