@@ -129,7 +129,9 @@ export function AgentInstanceEditDialog({
   const [inheritHarness, setInheritHarness] = React.useState(
     agent.personaId != null && agent.agentCommandOverride == null,
   );
-  const [agentArgs, setAgentArgs] = React.useState(agent.agentArgs.join(","));
+  const [agentArgs, setAgentArgs] = React.useState(
+    (agent.agentArgs ?? []).join(","),
+  );
   const [parallelism, setParallelism] = React.useState(
     String(agent.parallelism),
   );
@@ -184,7 +186,7 @@ export function AgentInstanceEditDialog({
       setInheritHarness(
         agent.personaId != null && agent.agentCommandOverride == null,
       );
-      setAgentArgs(agent.agentArgs.join(","));
+      setAgentArgs((agent.agentArgs ?? []).join(","));
       setParallelism(String(agent.parallelism));
       setSystemPrompt(agent.systemPrompt ?? "");
       setModel(agent.model ?? "");
@@ -671,7 +673,7 @@ export function AgentInstanceEditDialog({
         harnessOverride:
           agentCommandUpdate != null ? !inheritHarness : undefined,
         agentArgs:
-          parsedArgs.join(",") !== agent.agentArgs.join(",")
+          parsedArgs.join(",") !== (agent.agentArgs ?? []).join(",")
             ? parsedArgs
             : undefined,
         parallelism:
@@ -720,7 +722,8 @@ export function AgentInstanceEditDialog({
         // harmless server-side, but it's noise in the persisted record.
         respondToAllowlist:
           respondTo === "allowlist" &&
-          respondToAllowlist.join(",") !== agent.respondToAllowlist.join(",")
+          respondToAllowlist.join(",") !==
+            (agent.respondToAllowlist ?? []).join(",")
             ? respondToAllowlist
             : undefined,
       };

@@ -7,6 +7,22 @@ export function normalizeRelayUrl(input: string): string | null {
   const trimmed = input.trim().replace(/\/+$/, "");
   if (!trimmed) return null;
 
+  // buzz://connect?relay=wss://…  (desktop deep-link form pasted into web UI)
+  if (trimmed.toLowerCase().startsWith("buzz:")) {
+    try {
+      const url = new URL(trimmed);
+      if (url.protocol === "buzz:" && (url.host === "connect" || url.host === "join" || url.host === "add-community")) {
+        const relay = url.searchParams.get("relay");
+        if (relay && (relay.startsWith("wss://") || relay.startsWith("ws://"))) {
+          return relay.replace(/\/+$/, "");
+        }
+      }
+    } catch {
+      return null;
+    }
+    return null;
+  }
+
   // Already ws(s)://
   if (trimmed.startsWith("wss://") || trimmed.startsWith("ws://")) {
     try {

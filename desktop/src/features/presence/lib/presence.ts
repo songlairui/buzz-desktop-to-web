@@ -19,9 +19,10 @@ export function parseLivePresenceEvent(event: {
 // "wants" an update only for a pubkey it actually requested.
 export function presenceQueryWantsPubkey(
   queryKey: readonly unknown[],
-  pubkey: string,
+  pubkey: string | undefined | null,
 ): boolean {
-  return queryKey.length > 1 && queryKey.includes(pubkey);
+  if (!pubkey) return false;
+  return Array.isArray(queryKey) && queryKey.length > 1 && queryKey.includes(pubkey);
 }
 
 // get_presence omits offline/unknown pubkeys, so a live online event often

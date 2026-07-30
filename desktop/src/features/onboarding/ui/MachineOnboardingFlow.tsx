@@ -65,6 +65,9 @@ export function MachineOnboardingFlow({
     null,
   );
   const [readyRuntimeIds, setReadyRuntimeIds] = React.useState<string[]>([]);
+  const [hostDisplayName, setHostDisplayName] = React.useState<string | null>(
+    null,
+  );
   const handleReadyRuntimeIdsChange = React.useCallback(
     (runtimeIds: readonly string[]) => {
       setReadyRuntimeIds(Array.from(new Set(runtimeIds)));
@@ -72,17 +75,46 @@ export function MachineOnboardingFlow({
     [],
   );
 
+  // Web host-held identity: surface "Continue as <name>" without forcing import.
+  React.useEffect(() => {
+    let cancelled = false;
+    void getIdentity()
+      .then((identity) => {
+        if (cancelled) return;
+        if (identity.pubkey) {
+          setSelectedPubkey(identity.pubkey);
+          setHostDisplayName(identity.displayName || null);
+          queryClient.setQueryData(["identity"], identity);
+        }
+      })
+      .catch(() => {
+        /* host unavailable — keep Create / Import CTAs */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [queryClient]);
+
   const loadFreshIdentity = React.useCallback(async () => {
     setIsPending(true);
     setError(null);
     try {
-      const identity = await getIdentity();
+      // Desktop: getIdentity() returns an ephemeral keyring key, then BackupStep
+      // shows get_nsec. Web host-signing: ensure a durable host-held key exists
+      // (create if missing, otherwise keep current) so BackupStep can export nsec.
+      // Does NOT rotate on "Continue setup".
+      let identity = await getIdentity();
+      try {
+        identity = await persistCurrentIdentity();
+      } catch {
+        // If host cannot re-persist, still continue with getIdentity result.
+      }
       queryClient.setQueryData(["identity"], identity);
       setSelectedPubkey(identity.pubkey);
       setPage("backup");
     } catch (cause) {
       setError(
-        cause instanceof Error ? cause.message : "Failed to load identity",
+        cause instanceof Error ? cause.message : "Failed to create identity",
       );
     } finally {
       setIsPending(false);
@@ -98,7 +130,7 @@ export function MachineOnboardingFlow({
     setIsPending(true);
     setError(null);
     try {
-      const identity = await persistCurrentIdentity();
+      const identity = await persistCurrentIdentity({ forceNew: true });
       queryClient.setQueryData(["identity"], identity);
       setSelectedPubkey(identity.pubkey);
       setPage("backup");
@@ -161,6 +193,23 @@ export function MachineOnboardingFlow({
                 Your people, your agents, your projects —<br />
                 all in one place.
               </p>
+              {selectedPubkey ? (
+                <p
+                  className="mt-4 max-w-[520px] text-sm leading-6 text-foreground/75"
+                  data-testid="host-held-identity-hint"
+                >
+                  This web client uses a host-held identity
+                  {hostDisplayName ? (
+                    <>
+                      {" "}
+                      (<span className="font-medium text-foreground">{hostDisplayName}</span>
+                      )
+                    </>
+                  ) : null}
+                  . You do not need to paste an nsec unless you want a different
+                  key.
+                </p>
+              ) : null}
               {error ? (
                 <p className="mt-4 text-sm text-destructive">{error}</p>
               ) : null}
@@ -174,7 +223,9 @@ export function MachineOnboardingFlow({
                   {isPending
                     ? "Loading identity…"
                     : selectedPubkey
-                      ? "Continue setup"
+                      ? hostDisplayName
+                        ? `Continue as ${hostDisplayName}`
+                        : "Continue with host key"
                       : "Create a new identity key"}
                 </Button>
                 <Button

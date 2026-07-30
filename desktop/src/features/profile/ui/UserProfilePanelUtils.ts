@@ -124,15 +124,15 @@ export function deriveProfileChannels(
     channels?.map((channel) => [channel.name, channel]) ?? [],
   );
 
-  relayAgent?.channels.forEach((name, index) => {
+  (relayAgent?.channels ?? []).forEach((name, index) => {
     const channel = channelsByName.get(name);
-    const id = relayAgent.channelIds[index] ?? channel?.id ?? name;
+    const id = (relayAgent?.channelIds ?? [])[index] ?? channel?.id ?? name;
     links.set(id, { id, name });
   });
 
   if (managedAgent && channels) {
     for (const channel of channels) {
-      const isMember = channel.memberPubkeys.some(
+      const isMember = (channel.memberPubkeys ?? []).some(
         (memberPubkey) => memberPubkey.toLowerCase() === pubkeyLower,
       );
       if (isMember) {
@@ -319,10 +319,15 @@ export function personaManagedAgentUpdate(
   return hasChanges ? input : null;
 }
 
-function stringArrayEqual(left: readonly string[], right: readonly string[]) {
-  if (left.length !== right.length) return false;
+function stringArrayEqual(
+  left: readonly string[] | undefined,
+  right: readonly string[] | undefined,
+) {
+  const leftArr = left ?? [];
+  const rightArr = right ?? [];
+  if (leftArr.length !== rightArr.length) return false;
 
-  return left.every((value, index) => value === right[index]);
+  return leftArr.every((value, index) => value === rightArr[index]);
 }
 
 function stringRecordEqual(

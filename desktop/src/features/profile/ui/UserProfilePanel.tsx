@@ -707,8 +707,9 @@ export function UserProfilePanel({
     ? ownerProfileQuery.data
     : currentProfileQuery.data;
   const memoryCount =
-    memoryQuery.data &&
-    (memoryQuery.data.core ? 1 : 0) + memoryQuery.data.memories.length;
+    memoryQuery.data && Array.isArray(memoryQuery.data.memories)
+      ? (memoryQuery.data.core ? 1 : 0) + memoryQuery.data.memories.length
+      : undefined;
   const agentInstruction = resolveAgentInstruction(
     managedAgent,
     resolvedPersona,

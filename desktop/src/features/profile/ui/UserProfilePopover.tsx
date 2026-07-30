@@ -105,7 +105,7 @@ function findCachedOneToOneDm(
       }
 
       const participantPubkeys =
-        channel.participantPubkeys.map(normalizePubkey);
+        (channel.participantPubkeys ?? []).map(normalizePubkey);
       if (!participantPubkeys.includes(normalizedTargetPubkey)) {
         return false;
       }

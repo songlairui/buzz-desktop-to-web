@@ -29,9 +29,12 @@ export function useArchivedIdentitiesQuery(enabled = true) {
 /** `undefined` while the snapshot loads so callers can defer the flair. */
 export function useIsIdentityArchived(pubkey: string): boolean | undefined {
   const query = useArchivedIdentitiesQuery();
-  if (!query.data) return undefined;
+  // Guard both missing snapshot and malformed payloads (e.g. web shim
+  // historically returned `[]` for unhandled list_archived_identities).
+  const archived = query.data?.archived;
+  if (!Array.isArray(archived)) return undefined;
   const lower = pubkey.toLowerCase();
-  return query.data.archived.includes(lower);
+  return archived.includes(lower);
 }
 
 /**

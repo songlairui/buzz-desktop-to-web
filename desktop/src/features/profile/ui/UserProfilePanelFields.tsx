@@ -203,10 +203,11 @@ export function buildPublicFields({
     });
   }
 
-  if (relayAgent?.capabilities.length) {
+  if ((relayAgent?.capabilities ?? []).length) {
+    const capabilitiesLabel = (relayAgent?.capabilities ?? []).join(", ");
     fields.push({
-      copyValue: relayAgent.capabilities.join(", "),
-      displayValue: relayAgent.capabilities.join(", "),
+      copyValue: capabilitiesLabel,
+      displayValue: capabilitiesLabel,
       icon: Server,
       label: "Capabilities",
       testId: "user-profile-capabilities",

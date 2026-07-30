@@ -19,6 +19,7 @@ export type ParsedInvite =
  *  - `https://<relay>/invite/<code>` → `{ relayWsUrl: "wss://<relay>", code }`
  *  - `http://<relay>/invite/<code>`  → `{ relayWsUrl: "ws://<relay>", code }`
  *  - `buzz://join?relay=<wsUrl>&code=<code>` → `{ relayWsUrl, code }`
+ *  - `buzz://connect?relay=<wsUrl>` → `{ relayWsUrl, code: "" }` (connect, no invite)
  *  - bare code (no `://`, no `/`)    → `{ code }`
  *
  * Returns `null` for empty input or inputs that don't match any form.
@@ -32,12 +33,12 @@ export function parseInviteInput(input: string): ParsedInvite | null {
     const url = new URL(trimmed);
 
     // buzz://join?relay=...&code=...
+    // buzz://connect?relay=...  (no code — open community connect)
     // Non-special schemes put the authority in `host`, not `pathname`.
     if (url.protocol === "buzz:") {
-      if (url.host !== "join") return null;
+      if (url.host !== "join" && url.host !== "connect") return null;
       const relay = url.searchParams.get("relay");
-      const code = url.searchParams.get("code");
-      if (!relay || !code) return null;
+      if (!relay) return null;
       if (!relay.startsWith("ws://") && !relay.startsWith("wss://"))
         return null;
       if (url.username || url.password || url.hash) return null;
@@ -49,6 +50,18 @@ export function parseInviteInput(input: string): ParsedInvite | null {
       } catch {
         return null;
       }
+      if (url.host === "connect") {
+        // Connect links have no invite code; callers use onConnect(relay).
+        // Represent as a bare relay by returning a sentinel empty code only when
+        // the form path expects ParsedInvite — InviteRedeemForm treats missing
+        // code via normalizeRelayUrl/onConnect when we surface relay alone.
+        // Prefer returning null so normalizeRelayUrl/onConnect path runs… but
+        // normalizeRelayUrl does not understand buzz://. So expand to a
+        // pseudo-invite without code by encoding relay-only as join-less:
+        return { relayWsUrl: relay, code: "" };
+      }
+      const code = url.searchParams.get("code");
+      if (!code) return null;
       return { relayWsUrl: relay, code };
     }
 

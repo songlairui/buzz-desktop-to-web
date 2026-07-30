@@ -26,6 +26,12 @@ export default defineConfig(async () => ({
     alias: {
       "@": "/src",
       "@features-manifest": path.resolve(__dirname, "../preview-features.json"),
+      "@tauri-apps/api/core": path.resolve(__dirname, "./src/shared/api/shims/tauri-core-shim.ts"),
+      "@tauri-apps/api/event": path.resolve(__dirname, "./src/shared/api/shims/tauri-event-shim.ts"),
+      "@tauri-apps/api/window": path.resolve(__dirname, "./src/shared/api/shims/tauri-window-shim.ts"),
+      "@tauri-apps/api/webview": path.resolve(__dirname, "./src/shared/api/shims/tauri-webview-shim.ts"),
+      "@tauri-apps/api/path": path.resolve(__dirname, "./src/shared/api/shims/tauri-path-shim.ts"),
+      "@tauri-apps/api/app": path.resolve(__dirname, "./src/shared/api/shims/tauri-app-shim.ts"),
     },
   },
 
@@ -48,6 +54,13 @@ export default defineConfig(async () => ({
     watch: {
       // 3. tell Vite to ignore watching `src-tauri`
       ignored: ["**/src-tauri/**"],
+    },
+    proxy: {
+      // buzz-web: host IPC daemon (agent-daemon-server.js)
+      "/api": {
+        target: "http://127.0.0.1:3001",
+        changeOrigin: true,
+      },
     },
   },
 }));

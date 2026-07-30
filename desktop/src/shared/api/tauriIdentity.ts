@@ -33,9 +33,13 @@ export async function importIdentity(nsec: string): Promise<Identity> {
   );
 }
 
-export async function persistCurrentIdentity(): Promise<Identity> {
+export async function persistCurrentIdentity(options?: {
+  forceNew?: boolean;
+}): Promise<Identity> {
   return fromRawIdentity(
-    await invokeTauri<RawIdentity>("persist_current_identity"),
+    await invokeTauri<RawIdentity>("persist_current_identity", {
+      forceNew: options?.forceNew === true,
+    }),
   );
 }
 

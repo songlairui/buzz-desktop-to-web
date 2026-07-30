@@ -522,14 +522,17 @@ export function useUpdateProfileMutation() {
         // cache too — evict so the next batch run picks up the new profile
         // instead of the fresh-looking stale entry, then poke the aggregates.
         evictUsersBatchEntries(queryClient, [pubkey]);
-        void queryClient.invalidateQueries({
-          queryKey: ["user-profile", pubkey.toLowerCase()],
-        });
-        void queryClient.invalidateQueries({
-          predicate: (query) =>
-            query.queryKey[0] === "users-batch" &&
-            query.queryKey.includes(pubkey.toLowerCase()),
-        });
+        if (pubkey) {
+          void queryClient.invalidateQueries({
+            queryKey: ["user-profile", pubkey.toLowerCase()],
+          });
+          void queryClient.invalidateQueries({
+            predicate: (query) =>
+              query.queryKey[0] === "users-batch" &&
+              Array.isArray(query.queryKey) &&
+              query.queryKey.includes(pubkey.toLowerCase()),
+          });
+        }
       }
     },
     onSettled: async () => {

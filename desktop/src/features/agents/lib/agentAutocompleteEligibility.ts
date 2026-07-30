@@ -10,23 +10,24 @@ export function getSharedChannelIds(channels: readonly Channel[] | undefined) {
 }
 
 export function relayAgentIsSharedWithUser(
-  agent: Pick<RelayAgent, "channelIds" | "respondTo" | "respondToAllowlist">,
+  agent: Pick<RelayAgent, "channelIds" | "respondTo" | "respondToAllowlist"> | null | undefined,
   sharedChannelIds: ReadonlySet<string>,
   currentPubkey?: string | null,
 ) {
+  if (!agent) return false;
   const normalizedCurrentPubkey = currentPubkey
     ? normalizePubkey(currentPubkey)
     : null;
 
   if (agent.respondTo === "allowlist" && normalizedCurrentPubkey) {
-    return agent.respondToAllowlist
+    return (agent.respondToAllowlist ?? [])
       .map((pubkey) => normalizePubkey(pubkey))
       .includes(normalizedCurrentPubkey);
   }
 
   return (
     agent.respondTo === "anyone" &&
-    agent.channelIds.some((channelId) => sharedChannelIds.has(channelId))
+    (agent.channelIds ?? []).some((channelId) => (sharedChannelIds ?? new Set()).has(channelId))
   );
 }
 
@@ -37,16 +38,16 @@ export function getMentionableAgentPubkeys({
   sharedChannelIds,
 }: {
   currentPubkey?: string | null;
-  managedAgentPubkeys: Iterable<string>;
+  managedAgentPubkeys: Iterable<string> | undefined;
   relayAgents: readonly RelayAgent[] | undefined;
   sharedChannelIds: ReadonlySet<string>;
 }) {
   const pubkeys = new Set(
-    [...managedAgentPubkeys].map((pubkey) => normalizePubkey(pubkey)),
+    [...(managedAgentPubkeys ?? [])].map((pubkey) => normalizePubkey(pubkey)),
   );
 
   for (const agent of relayAgents ?? []) {
-    if (relayAgentIsSharedWithUser(agent, sharedChannelIds, currentPubkey)) {
+    if (agent && agent.pubkey && relayAgentIsSharedWithUser(agent, sharedChannelIds, currentPubkey)) {
       pubkeys.add(normalizePubkey(agent.pubkey));
     }
   }
@@ -59,8 +60,8 @@ export function isAgentIdentityInManagedList(
   managedAgentPubkeys: ReadonlySet<string>,
 ) {
   return (
-    candidate.isAgent !== true ||
-    managedAgentPubkeys.has(normalizePubkey(candidate.pubkey))
+    candidate?.isAgent !== true ||
+    (managedAgentPubkeys ?? new Set()).has(normalizePubkey(candidate?.pubkey ?? ""))
   );
 }
 
@@ -77,24 +78,13 @@ export function shouldHideAgentFromMentions({
   mentionableAgentPubkeys: ReadonlySet<string>;
   directoryAgentPubkeys: ReadonlySet<string>;
 }) {
-  if (!isAgent) return false;
+  if (!isAgent || !pubkey) return false;
   const normalized = normalizePubkey(pubkey);
   // Invocable => always show.
-  if (mentionableAgentPubkeys.has(normalized)) return false;
+  if ((mentionableAgentPubkeys ?? new Set()).has(normalized)) return false;
   // Non-member, non-invocable => hide (preserves prior behavior).
   if (!isMember) return true;
-  // Member (Option B): hide only when we have an explicit not-invocable
-  // signal — a relay directory (kind:10100) entry that excludes us.
-  // Unknown invocability (not in directory) => show.
-  //
-  // NOTE: this assumes `directoryAgentPubkeys` and `mentionableAgentPubkeys`
-  // share the same source query (`relayAgentsQuery.data`), so directory
-  // presence without membership in `mentionableAgentPubkeys` is a real
-  // explicit-exclusion signal. If a future change sources the directory set
-  // from a different query, an agent that's directory-present but whose
-  // mentionability is still loading could be hidden prematurely — keep the
-  // two sets derived from the same query.
-  return directoryAgentPubkeys.has(normalized);
+  return (directoryAgentPubkeys ?? new Set()).has(normalized);
 }
 
 type AgentAutocompleteCandidate = {

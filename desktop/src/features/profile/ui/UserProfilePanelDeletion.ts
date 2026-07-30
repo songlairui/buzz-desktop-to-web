@@ -54,7 +54,7 @@ export function useProfileAgentDeletion({
       );
       for (const channel of channels ?? []) {
         if (
-          channel.memberPubkeys.some(
+          (channel.memberPubkeys ?? []).some(
             (memberPubkey) => memberPubkey.toLowerCase() === normalizedPubkey,
           )
         ) {

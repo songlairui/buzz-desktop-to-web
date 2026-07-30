@@ -202,6 +202,16 @@ export function InviteRedeemForm({
         : bareCodeRelayUrl.trim();
       if (!relayWsUrl) return;
 
+      // buzz://connect?relay=… parses as invite with empty code — open-connect path.
+      if (
+        hasInviteRelay(parsedInvite) &&
+        !parsedInvite.code &&
+        onConnect
+      ) {
+        onConnect(relayWsUrl, apiToken.trim() || undefined);
+        return;
+      }
+
       setPolicyError(null);
       setIsLoadingPolicy(true);
       try {

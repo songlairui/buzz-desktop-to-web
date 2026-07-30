@@ -1,0 +1,28 @@
+# Dokploy / local static host for buzz-web (Desktop → browser).
+# Upstream `docker-compose.yml` remains the full relay stack.
+# Deploy path on this host: /etc/dokploy/compose/buzz-chat/
+version: "3.8"
+
+services:
+  buzz-chat-web:
+    image: nginx:alpine
+    container_name: buzz-chat-web
+    restart: always
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./desktop/dist:/usr/share/nginx/html:ro
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    networks:
+      - dokploy-network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.buzz-chat.rule=Host(`chat.f.mtt.cool`)"
+      - "traefik.http.routers.buzz-chat.entrypoints=websecure"
+      - "traefik.http.routers.buzz-chat.tls=true"
+      - "traefik.http.routers.buzz-chat.tls.certresolver=cloudflare"
+      - "traefik.http.services.buzz-chat.loadbalancer.server.port=80"
+
+networks:
+  dokploy-network:
+    external: true
