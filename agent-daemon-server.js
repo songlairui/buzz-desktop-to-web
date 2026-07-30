@@ -1578,24 +1578,70 @@ function ipcCreateManagedAgent(args) {
   const env = getEnvConfig();
   const ownerPk = hostPubkey();
 
+  // Prefer explicit create input → global preferred runtime command → env → pi wrapper.
+  const globalCfg = loadGlobalAgentConfig();
+  let agentCommand =
+    input.agentCommand ||
+    input.agent_command ||
+    env.BUZZ_ACP_AGENT_COMMAND ||
+    null;
+  // Map catalog runtime ids / friendly names to a spawnable command when the
+  // UI only sent preferred_runtime or a catalog id as the command.
+  if (!agentCommand && globalCfg.preferred_runtime) {
+    agentCommand = globalCfg.preferred_runtime;
+  }
+  if (!agentCommand) agentCommand = "pi-acp-wrapper.js";
+
+  // Normalize catalog ids to host-local commands.
+  const cmdAliases = {
+    "pi-coding-agent": "pi-acp-wrapper.js",
+    pi: "pi-acp-wrapper.js",
+    "buzz-agent": "pi-acp-wrapper.js",
+    grok: "grok",
+    goose: "goose",
+    claude: "claude-agent-acp",
+    codex: "codex-acp",
+  };
+  const baseName = path.basename(String(agentCommand));
+  if (cmdAliases[baseName]) agentCommand = cmdAliases[baseName];
+  if (cmdAliases[String(agentCommand)]) {
+    agentCommand = cmdAliases[String(agentCommand)];
+  }
+
+  let agentArgs = Array.isArray(input.agentArgs || input.agent_args)
+    ? (input.agentArgs || input.agent_args).slice()
+    : null;
+  if (!agentArgs) {
+    // Default args by harness (desktop PRESET_HARNESSES parity).
+    if (agentCommand === "grok" || baseName === "grok") {
+      agentArgs = ["agent", "--always-approve", "stdio"];
+    } else if (agentCommand === "goose" || baseName === "goose") {
+      agentArgs = ["acp"];
+    } else if (
+      agentCommand === "pi-acp-wrapper.js" ||
+      String(agentCommand).endsWith("pi-acp-wrapper.js")
+    ) {
+      agentArgs = [];
+    } else {
+      agentArgs = ["acp"];
+    }
+  }
+
   const record = {
     pubkey,
     seckey_hex: seckeyHex,
     name,
     persona_id: input.personaId || input.persona_id || null,
-    runtime: input.runtime || null,
+    runtime: input.runtime || globalCfg.preferred_runtime || null,
     team_id: input.teamId || input.team_id || null,
     relay_url: (input.relayUrl || input.relay_url || RELAY_WS).replace(/\/+$/, ""),
     acp_command: input.acpCommand || input.acp_command || "buzz-acp",
-    agent_command:
-      input.agentCommand ||
-      input.agent_command ||
-      env.BUZZ_ACP_AGENT_COMMAND ||
-      "pi-coding-agent",
-    agent_command_override: input.agentCommandOverride || null,
-    agent_args: Array.isArray(input.agentArgs || input.agent_args)
-      ? input.agentArgs || input.agent_args
-      : ["acp"],
+    agent_command: agentCommand,
+    agent_command_override:
+      input.agentCommandOverride ??
+      input.agent_command_override ??
+      (input.harnessOverride || input.harness_override ? agentCommand : null),
+    agent_args: agentArgs,
     mcp_command: input.mcpCommand || input.mcp_command || "",
     turn_timeout_seconds:
       input.turnTimeoutSeconds ?? input.turn_timeout_seconds ?? 320,
@@ -1606,9 +1652,21 @@ function ipcCreateManagedAgent(args) {
     parallelism: input.parallelism ?? 1,
     system_prompt: input.systemPrompt ?? input.system_prompt ?? null,
     avatar_url: input.avatarUrl ?? input.avatar_url ?? null,
-    model: input.model ?? env.BUZZ_ACP_MODEL ?? env.GOOSE_MODEL ?? "grok-4.5",
-    provider: input.provider ?? env.GOOSE_PROVIDER ?? "openai",
-    env_vars: input.envVars || input.env_vars || {},
+    model:
+      input.model ??
+      globalCfg.model ??
+      env.BUZZ_ACP_MODEL ??
+      env.GOOSE_MODEL ??
+      "grok-4.5",
+    provider:
+      input.provider ??
+      globalCfg.provider ??
+      env.GOOSE_PROVIDER ??
+      "openai",
+    env_vars: {
+      ...(globalCfg.env_vars || {}),
+      ...(input.envVars || input.env_vars || {}),
+    },
     status: "stopped",
     pid: null,
     created_at: now,
@@ -1641,22 +1699,38 @@ function ipcCreateManagedAgent(args) {
   store.agents.push(record);
   saveManagedAgentsStore(store);
 
+  // Publish kind:0 so the agent shows a display name on the relay even before start.
+  ensureAgentProfilePublished(record).catch((err) =>
+    console.warn("create agent profile publish failed:", err.message),
+  );
+
   let spawnError = null;
+  let startedSummary = null;
   const shouldSpawn =
     input.spawnAfterCreate !== false && input.spawn_after_create !== false;
   if (shouldSpawn) {
     try {
-      // Best-effort: do not block create on process spawn for web MVP.
-      // Full multi-process agent runtime is desktop-only for now.
-      spawnError =
-        "Web host records the agent identity; start the host buzz-agent service to run an ACP process, or use @mentions once an agent is online on the relay.";
+      // Host CAN spawn ACP processes — this used to be a hard-coded stub.
+      startedSummary = ipcStartManagedAgent({ pubkey });
     } catch (err) {
       spawnError = err instanceof Error ? err.message : String(err);
+      console.warn(
+        `[create_managed_agent] spawn failed for ${name}:`,
+        spawnError,
+      );
+      // Keep the identity record; UI can retry Start.
     }
   }
 
+  // Re-read after optional start so status/pid reflect the live process.
+  const afterStore = loadManagedAgentsStore();
+  const after =
+    afterStore.agents.find(
+      (a) => String(a.pubkey).toLowerCase() === pubkey.toLowerCase(),
+    ) || record;
+
   return {
-    agent: managedAgentSummary(record),
+    agent: startedSummary || managedAgentSummary(after),
     private_key_nsec: privateKeyNsec,
     profile_sync_error: null,
     spawn_error: spawnError,
