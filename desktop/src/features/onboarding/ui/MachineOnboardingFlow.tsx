@@ -75,17 +75,18 @@ export function MachineOnboardingFlow({
     [],
   );
 
-  // Web host-held identity: surface "Continue as <name>" without forcing import.
+  // Web host-held identity: surface "Continue as <name>" and mark machine
+  // onboarding complete so CommunityApp (auto-connect / Welcome) can mount.
   React.useEffect(() => {
     let cancelled = false;
     void getIdentity()
       .then((identity) => {
-        if (cancelled) return;
-        if (identity.pubkey) {
-          setSelectedPubkey(identity.pubkey);
-          setHostDisplayName(identity.displayName || null);
-          queryClient.setQueryData(["identity"], identity);
-        }
+        if (cancelled || !identity.pubkey) return;
+        setSelectedPubkey(identity.pubkey);
+        setHostDisplayName(identity.displayName || null);
+        queryClient.setQueryData(["identity"], identity);
+        // Host already holds the seckey — skip Create/Import gate.
+        complete(identity.pubkey);
       })
       .catch(() => {
         /* host unavailable — keep Create / Import CTAs */
@@ -93,7 +94,7 @@ export function MachineOnboardingFlow({
     return () => {
       cancelled = true;
     };
-  }, [queryClient]);
+  }, [complete, queryClient]);
 
   const loadFreshIdentity = React.useCallback(async () => {
     setIsPending(true);

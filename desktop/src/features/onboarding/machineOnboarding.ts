@@ -1,4 +1,5 @@
 import * as React from "react";
+import { isTauri } from "@tauri-apps/api/core";
 import { type QueryStatus, useQueryClient } from "@tanstack/react-query";
 
 import { useIdentityQuery } from "@/shared/api/hooks";
@@ -148,6 +149,18 @@ export function useMachineOnboardingState({
       identityQuery.status !== "success" ||
       identityLost
     ) {
+      return;
+    }
+    // Browser web client: host daemon holds the seckey. Treat a successful
+    // get_identity as machine-onboarding complete so we do not trap users on
+    // Create/Import. Community Welcome / connect still runs separately.
+    if (!isTauri()) {
+      window.localStorage.setItem(
+        completionKey(MACHINE_ONBOARDING_COMPLETION_STORAGE_KEY, currentPubkey),
+        "true",
+      );
+      setCompletedPubkey(currentPubkey);
+      setEvaluatedPubkey(currentPubkey);
       return;
     }
     if (
