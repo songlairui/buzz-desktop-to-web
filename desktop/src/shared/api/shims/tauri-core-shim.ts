@@ -94,29 +94,6 @@ async function hostIpc<T = unknown>(
 const wsSockets = new Map<number, WebSocket>();
 let nextWsId = 1;
 
-function mockRawAcpCatalogEntry(id = "pi-coding-agent", label = "Pi Coding Agent"): Record<string, unknown> {
-  return {
-    id,
-    label,
-    avatar_url: null,
-    availability: "available",
-    command: id,
-    binary_path: "/usr/local/bin/" + id,
-    default_args: [],
-    mcp_command: null,
-    model_env_var: "BUZZ_AGENT_MODEL",
-    provider_env_var: "BUZZ_AGENT_PROVIDER",
-    thinking_env_var: "BUZZ_AGENT_THINKING_EFFORT",
-    install_hint: null,
-    install_instructions_url: null,
-    can_auto_install: false,
-    underlying_cli_path: null,
-    node_required: false,
-    auth_status: "authenticated",
-    login_hint: null,
-  };
-}
-
 export async function invoke<T = unknown>(
   cmd: string,
   args: Record<string, unknown> = {}
@@ -504,11 +481,30 @@ export async function invoke<T = unknown>(
       return (await hostIpc(cmd, args)) as T;
 
     case "discover_acp_providers":
-    case "discover_acp_runtimes":
-      return [
-        mockRawAcpCatalogEntry("pi-coding-agent", "Pi Coding Agent"),
-        mockRawAcpCatalogEntry("claude", "Claude Agent ACP"),
-      ] as unknown as T;
+    case "discover_acp_runtimes": {
+      // Host PATH-probes real CLIs (goose, claude, codex, pi, buzz-acp, …).
+      try {
+        const catalog = await hostIpc<unknown[]>(cmd, args);
+        if (Array.isArray(catalog) && catalog.length > 0) {
+          return catalog as T;
+        }
+      } catch (err) {
+        console.warn("[Web-Shim] discover_acp_providers failed", err);
+      }
+      // Safe empty catalog — never return broken auth_status shapes.
+      return [] as unknown as T;
+    }
+
+    case "discover_managed_agent_prereqs":
+      return (await hostIpc(cmd, args)) as T;
+
+    case "discover_git_bash_prerequisite": {
+      try {
+        return (await hostIpc(cmd, args)) as T;
+      } catch {
+        return null as unknown as T;
+      }
+    }
 
     case "list_teams":
     case "list_projects":

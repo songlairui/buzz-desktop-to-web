@@ -1749,6 +1749,381 @@ async function ipcListArchivedIdentities() {
   }
 }
 
+// ── ACP runtime discovery (Settings → Agents / harness catalog) ─────────────
+// Desktop probes PATH for known harness CLIs and returns AcpRuntimeCatalogEntry.
+// Web host must do the same on the Fedora machine — not hardcode fake "available".
+
+const HOST_PATH_EXTRA = [
+  path.join(process.env.HOME || "/home/lary", ".local/bin"),
+  path.join(process.env.HOME || "/home/lary", ".local/share/pnpm"),
+  path.join(process.env.HOME || "/home/lary", ".local/share/pnpm/bin"),
+  path.join(process.env.HOME || "/home/lary", ".opencode/bin"),
+  "/usr/local/bin",
+  "/usr/bin",
+];
+
+function hostSearchPath() {
+  const base = process.env.PATH || "";
+  const parts = base.split(path.delimiter).filter(Boolean);
+  for (const extra of HOST_PATH_EXTRA) {
+    if (!parts.includes(extra)) parts.unshift(extra);
+  }
+  return parts.join(path.delimiter);
+}
+
+function resolveCommandOnPath(command) {
+  if (!command || typeof command !== "string") return null;
+  const trimmed = command.trim();
+  if (!trimmed) return null;
+  // Absolute / relative path
+  if (trimmed.includes("/") || trimmed.startsWith(".")) {
+    try {
+      if (fs.existsSync(trimmed) && fs.statSync(trimmed).isFile()) {
+        try {
+          fs.accessSync(trimmed, fs.constants.X_OK);
+          return path.resolve(trimmed);
+        } catch {
+          return path.resolve(trimmed);
+        }
+      }
+    } catch {
+      return null;
+    }
+  }
+  const search = hostSearchPath().split(path.delimiter);
+  for (const dir of search) {
+    if (!dir) continue;
+    const candidate = path.join(dir, trimmed);
+    try {
+      if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) {
+        return candidate;
+      }
+    } catch {
+      /* continue */
+    }
+  }
+  // `command -v` fallback (respects login aliases less, but catches more PATH)
+  try {
+    const out = execSync(`command -v ${JSON.stringify(trimmed)}`, {
+      encoding: "utf8",
+      env: { ...process.env, PATH: hostSearchPath() },
+      timeout: 2000,
+    }).trim();
+    if (out && fs.existsSync(out)) return out;
+  } catch {
+    /* not found */
+  }
+  return null;
+}
+
+/**
+ * Known harness catalog (subset of desktop KNOWN_ACP_RUNTIMES + host pi wrapper).
+ * availability is computed by probing command names on PATH.
+ */
+const KNOWN_HOST_ACP_RUNTIMES = [
+  {
+    id: "buzz-agent",
+    label: "Buzz Agent",
+    commands: ["buzz-agent", "buzz-acp"],
+    // Host ships buzz-acp binary under the repo target dir.
+    extraPaths: [
+      path.join(__dirname, "target/release/buzz-acp"),
+      path.join(__dirname, "target/debug/buzz-acp"),
+    ],
+    avatar_url: "",
+    mcp_command: "buzz-dev-mcp",
+    underlying_cli: null,
+    model_env_var: "BUZZ_AGENT_MODEL",
+    provider_env_var: "BUZZ_AGENT_PROVIDER",
+    thinking_env_var: "BUZZ_AGENT_THINKING_EFFORT",
+    install_hint: "On this web host, Buzz Agent is the local buzz-acp process.",
+    install_instructions_url: "https://github.com/block/buzz",
+    can_auto_install: false,
+    requires_external_cli: false,
+    login_hint: null,
+    auth_probe: null,
+    source: "builtin",
+  },
+  {
+    id: "goose",
+    label: "Goose",
+    commands: ["goose"],
+    extraPaths: [],
+    avatar_url: "",
+    mcp_command: null,
+    underlying_cli: "goose",
+    model_env_var: "GOOSE_MODEL",
+    provider_env_var: "GOOSE_PROVIDER",
+    thinking_env_var: "GOOSE_THINKING_EFFORT",
+    install_hint: "Buzz talks to Goose through the Goose CLI.",
+    install_instructions_url:
+      "https://goose-docs.ai/docs/getting-started/installation/",
+    can_auto_install: false,
+    requires_external_cli: true,
+    login_hint: null,
+    auth_probe: null,
+    source: "builtin",
+  },
+  {
+    id: "claude",
+    label: "Claude Code",
+    commands: ["claude-agent-acp", "claude-code-acp"],
+    extraPaths: [],
+    avatar_url: "",
+    mcp_command: null,
+    underlying_cli: "claude",
+    model_env_var: null,
+    provider_env_var: null,
+    thinking_env_var: null,
+    install_hint:
+      "Buzz talks to Claude Code through an ACP adapter (claude-agent-acp).",
+    install_instructions_url: "https://code.claude.com/docs/en/getting-started",
+    can_auto_install: false,
+    requires_external_cli: true,
+    login_hint: "Run the Claude CLI to complete authentication.",
+    auth_probe: ["claude", "auth", "status"],
+    source: "builtin",
+  },
+  {
+    id: "codex",
+    label: "Codex",
+    commands: ["codex-acp"],
+    extraPaths: [],
+    avatar_url: "",
+    mcp_command: null,
+    underlying_cli: "codex",
+    model_env_var: null,
+    provider_env_var: null,
+    thinking_env_var: null,
+    install_hint:
+      "Buzz talks to Codex through an ACP adapter (codex-acp).",
+    install_instructions_url: "https://developers.openai.com/codex/cli/",
+    can_auto_install: false,
+    requires_external_cli: true,
+    login_hint: "Run `codex login` to authenticate.",
+    auth_probe: ["codex", "login", "status"],
+    source: "builtin",
+  },
+  {
+    // Host-specific: pi-coding-agent is preferred runtime in global defaults.
+    // Prefer pi-acp-wrapper.js (ACP shim) then `pi` CLI on PATH.
+    id: "pi-coding-agent",
+    label: "Pi Coding Agent",
+    commands: ["pi-coding-agent", "pi"],
+    extraPaths: [path.join(__dirname, "pi-acp-wrapper.js")],
+    avatar_url: "",
+    mcp_command: null,
+    underlying_cli: "pi",
+    model_env_var: "BUZZ_AGENT_MODEL",
+    provider_env_var: "BUZZ_AGENT_PROVIDER",
+    thinking_env_var: "BUZZ_AGENT_THINKING_EFFORT",
+    install_hint:
+      "Install the Pi coding agent CLI, or use the host pi-acp-wrapper.js.",
+    install_instructions_url: "https://github.com/badlogic/pi-mono",
+    can_auto_install: false,
+    requires_external_cli: true,
+    login_hint: null,
+    auth_probe: null,
+    source: "preset",
+  },
+  {
+    id: "opencode",
+    label: "OpenCode",
+    commands: ["opencode"],
+    extraPaths: [],
+    avatar_url: "",
+    mcp_command: null,
+    underlying_cli: "opencode",
+    model_env_var: null,
+    provider_env_var: null,
+    thinking_env_var: null,
+    install_hint: "OpenCode CLI on PATH.",
+    install_instructions_url: "https://opencode.ai",
+    can_auto_install: false,
+    requires_external_cli: true,
+    login_hint: null,
+    auth_probe: null,
+    source: "preset",
+  },
+];
+
+function probeAuthStatus(probeArgs) {
+  if (!probeArgs || !probeArgs.length) {
+    return { status: "not_applicable" };
+  }
+  const bin = resolveCommandOnPath(probeArgs[0]);
+  if (!bin) return { status: "unknown" };
+  try {
+    execSync(
+      [bin, ...probeArgs.slice(1)]
+        .map((a) => JSON.stringify(a))
+        .join(" "),
+      {
+        encoding: "utf8",
+        env: { ...process.env, PATH: hostSearchPath() },
+        timeout: 5000,
+        stdio: ["ignore", "pipe", "pipe"],
+      },
+    );
+    return { status: "logged_in" };
+  } catch {
+    return { status: "logged_out" };
+  }
+}
+
+function resolveRuntimeBinary(def) {
+  for (const extra of def.extraPaths || []) {
+    try {
+      if (fs.existsSync(extra) && fs.statSync(extra).isFile()) {
+        return { command: path.basename(extra), binaryPath: path.resolve(extra) };
+      }
+    } catch {
+      /* continue */
+    }
+  }
+  for (const cmd of def.commands || []) {
+    const resolved = resolveCommandOnPath(cmd);
+    if (resolved) return { command: cmd, binaryPath: resolved };
+  }
+  return { command: null, binaryPath: null };
+}
+
+function classifyAvailability(def, command, binaryPath, underlyingCliPath) {
+  if (command && binaryPath) {
+    return "available";
+  }
+  if (def.requires_external_cli && def.underlying_cli) {
+    if (!underlyingCliPath) return "cli_missing";
+    // CLI present but ACP adapter/command missing
+    return "adapter_missing";
+  }
+  return "not_installed";
+}
+
+/**
+ * @returns {Array} RawAcpRuntimeCatalogEntry[] (snake_case, desktop-compatible)
+ */
+function ipcDiscoverAcpProviders() {
+  const nodePath = resolveCommandOnPath("node");
+  const entries = [];
+
+  for (const def of KNOWN_HOST_ACP_RUNTIMES) {
+    const { command, binaryPath } = resolveRuntimeBinary(def);
+    const underlyingCliPath = def.underlying_cli
+      ? resolveCommandOnPath(def.underlying_cli)
+      : null;
+
+    let availability = classifyAvailability(
+      def,
+      command,
+      binaryPath,
+      underlyingCliPath,
+    );
+
+    // buzz-agent on this host: treat release binary or running unit as available
+    if (def.id === "buzz-agent" && availability !== "available") {
+      const release = path.join(__dirname, "target/release/buzz-acp");
+      if (fs.existsSync(release)) {
+        availability = "available";
+      }
+    }
+
+    const auth_status =
+      availability === "available"
+        ? def.auth_probe
+          ? probeAuthStatus(def.auth_probe)
+          : { status: "not_applicable" }
+        : { status: "unknown" };
+
+    // Prefer concrete command name when available; for buzz-acp use full path.
+    let resolvedCommand = command;
+    let resolvedBinary = binaryPath;
+    if (def.id === "buzz-agent" && !resolvedBinary) {
+      const release = path.join(__dirname, "target/release/buzz-acp");
+      if (fs.existsSync(release)) {
+        resolvedCommand = "buzz-acp";
+        resolvedBinary = release;
+        availability = "available";
+      }
+    }
+    if (def.id === "pi-coding-agent" && !resolvedBinary) {
+      const wrapper = path.join(__dirname, "pi-acp-wrapper.js");
+      if (fs.existsSync(wrapper)) {
+        resolvedCommand = wrapper;
+        resolvedBinary = wrapper;
+        availability = "available";
+      }
+    }
+
+    entries.push({
+      id: def.id,
+      label: def.label,
+      avatar_url: def.avatar_url || "",
+      availability,
+      command: resolvedCommand,
+      binary_path: resolvedBinary,
+      default_args: def.id === "pi-coding-agent" ? ["acp"] : [],
+      mcp_command: def.mcp_command,
+      model_env_var: def.model_env_var,
+      provider_env_var: def.provider_env_var,
+      thinking_env_var: def.thinking_env_var,
+      install_hint: def.install_hint || "",
+      install_instructions_url: def.install_instructions_url || "",
+      can_auto_install: Boolean(def.can_auto_install),
+      requires_external_cli: Boolean(def.requires_external_cli),
+      underlying_cli_path: underlyingCliPath,
+      node_required: false,
+      auth_status,
+      login_hint:
+        auth_status.status === "logged_in" ||
+        auth_status.status === "not_applicable"
+          ? null
+          : def.login_hint,
+      source: def.source || "builtin",
+      definition_env: {},
+    });
+  }
+
+  // Surface node presence for adapters that need npm install (informational).
+  if (!nodePath) {
+    for (const e of entries) {
+      if (
+        e.availability === "adapter_missing" ||
+        e.availability === "not_installed"
+      ) {
+        // leave as-is; node is present on this host typically
+      }
+    }
+  }
+
+  return entries;
+}
+
+function ipcDiscoverManagedAgentPrereqs(args) {
+  const input = args.input || args;
+  const acpCommand = String(input.acpCommand || input.acp_command || "buzz-acp").trim();
+  const mcpCommand = String(input.mcpCommand || input.mcp_command || "").trim();
+  const acpPath = resolveCommandOnPath(acpCommand);
+  const mcpPath = mcpCommand ? resolveCommandOnPath(mcpCommand) : null;
+  return {
+    acp: {
+      command: acpCommand,
+      resolved_path: acpPath,
+      available: Boolean(acpPath),
+    },
+    mcp: {
+      command: mcpCommand || "buzz-dev-mcp",
+      resolved_path: mcpPath,
+      available: mcpCommand ? Boolean(mcpPath) : true,
+    },
+  };
+}
+
+function ipcDiscoverGitBashPrerequisite() {
+  // Linux host — Git Bash is a Windows-only prerequisite; omit card.
+  return null;
+}
+
 // ── Models / signing (existing) ─────────────────────────────────────────────
 
 async function fetchFedoraModels() {
@@ -1837,6 +2212,18 @@ async function handleIpc(cmd, args = {}) {
     // Remote run destinations — NOT models. Empty = local-only create flow.
     case "discover_backend_providers":
       return [];
+
+    // Settings → Agents: PATH-probe harness CLIs (desktop discover_acp_providers).
+    case "discover_acp_providers":
+    case "discover_acp_runtimes":
+      return ipcDiscoverAcpProviders();
+
+    case "discover_managed_agent_prereqs":
+      return ipcDiscoverManagedAgentPrereqs(args);
+
+    case "discover_git_bash_prerequisite":
+      // null = hide Windows Git Bash card on Linux web host
+      return ipcDiscoverGitBashPrerequisite();
 
     case "list_personas":
       return ipcListPersonas();
