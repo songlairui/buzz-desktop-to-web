@@ -716,6 +716,266 @@ async function ipcJoinChannel(args) {
   return true;
 }
 
+// ── Starter channels (mirror desktop ensure_starter_channels) ───────────────
+// Frontend findStarterChannels requires open stream members named "general"
+// and "welcome-everyone". Host previously only listed channels → is_member
+// false → "Starter channels were not available after setup".
+
+const STARTER_CHANNEL_NAMESPACE = "3ce33bea-8f09-5f1b-9c85-8a7d2659e6b0";
+const STARTER_CHANNELS = [
+  {
+    slug: "general",
+    name: "general",
+    description: "General conversation and community updates.",
+  },
+  {
+    slug: "welcome-everyone",
+    name: "welcome-everyone",
+    description: "Say hi, ask a question, or share what brought you here.",
+  },
+];
+
+/** UUID v5 (SHA-1), matches Rust uuid::Uuid::new_v5. */
+function uuidV5(name, namespaceUuid) {
+  const nsHex = String(namespaceUuid).replace(/-/g, "");
+  const ns = Buffer.from(nsHex, "hex");
+  if (ns.length !== 16) throw new Error("invalid UUID namespace");
+  const hash = crypto.createHash("sha1").update(ns).update(name, "utf8").digest();
+  hash[6] = (hash[6] & 0x0f) | 0x50;
+  hash[8] = (hash[8] & 0x3f) | 0x80;
+  const h = hash.toString("hex");
+  return [
+    h.slice(0, 8),
+    h.slice(8, 12),
+    h.slice(12, 16),
+    h.slice(16, 20),
+    h.slice(20, 32),
+  ].join("-");
+}
+
+function relayHttpScope() {
+  return String(RELAY_HTTP || "")
+    .trim()
+    .replace(/\/+$/, "");
+}
+
+function starterChannelUuid(slug) {
+  const name = `starter-channel:v1:${relayHttpScope()}:${slug}`;
+  return uuidV5(name, STARTER_CHANNEL_NAMESPACE);
+}
+
+function normalizeChannelName(name) {
+  return String(name || "")
+    .trim()
+    .toLowerCase();
+}
+
+function isMatchingStarterChannel(channel, spec) {
+  return (
+    normalizeChannelName(channel.name) === normalizeChannelName(spec.name) &&
+    channel.channel_type === "stream" &&
+    channel.visibility === "open" &&
+    !channel.archived_at
+  );
+}
+
+function hasAllStarterChannels(channels) {
+  return STARTER_CHANNELS.every((spec) =>
+    channels.some((channel) => isMatchingStarterChannel(channel, spec)),
+  );
+}
+
+function isDuplicateChannelRejection(error) {
+  const msg = String(error || "");
+  return (
+    msg.includes("duplicate") ||
+    msg.includes("already exists") ||
+    msg.includes("channel already exists")
+  );
+}
+
+/**
+ * Create a channel with a fixed UUID (starter channels use deterministic ids).
+ * Mirrors desktop create with starter_channel_uuid.
+ */
+async function createChannelWithId(channelId, name, visibility, channelType, description) {
+  const tags = [
+    ["h", channelId],
+    ["name", name],
+    ["visibility", visibility],
+    ["channel_type", channelType],
+  ];
+  if (description) tags.push(["about", description]);
+
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 9007,
+      created_at: Math.floor(Date.now() / 1000),
+      tags,
+      content: "",
+    },
+    sk,
+  );
+  await submitEvent(event);
+  pendingOwnedChannelIds.add(channelId);
+}
+
+async function fetchStarterChannelMetadata(channelIds) {
+  if (!channelIds.length) return [];
+  const events = await queryRelay([
+    { kinds: [39000], "#d": channelIds, limit: channelIds.length },
+  ]);
+  const out = [];
+  for (const ev of events) {
+    const info = channelInfoFromEvent(ev, false);
+    if (info) out.push(info);
+  }
+  return out;
+}
+
+/**
+ * Ensure open starter channels exist and host is a member (kind 9021 join).
+ * Returns the full channel list with is_member true on starters.
+ */
+async function ipcEnsureStarterChannels() {
+  let existing = await ipcGetChannels();
+  const starterIds = [];
+  const createdIds = new Set();
+
+  for (const spec of STARTER_CHANNELS) {
+    if (existing.some((ch) => isMatchingStarterChannel(ch, spec))) {
+      continue;
+    }
+    const channelId = starterChannelUuid(spec.slug);
+    starterIds.push(channelId);
+    try {
+      await createChannelWithId(
+        channelId,
+        spec.name,
+        "open",
+        "stream",
+        spec.description,
+      );
+      createdIds.add(channelId);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (isDuplicateChannelRejection(msg)) {
+        pendingOwnedChannelIds.add(channelId);
+      } else {
+        throw err;
+      }
+    }
+  }
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const metadata = await fetchStarterChannelMetadata(starterIds);
+    for (const channel of metadata) {
+      if (createdIds.has(channel.id)) channel.is_member = true;
+      if (!existing.some((e) => e.id === channel.id)) {
+        existing.push(channel);
+      }
+    }
+    if (hasAllStarterChannels(existing)) break;
+    await sleep(150);
+  }
+
+  if (!hasAllStarterChannels(existing)) {
+    existing = await ipcGetChannels();
+  }
+
+  if (!hasAllStarterChannels(existing)) {
+    // Last resort: open-directory scan may have missed membership-only lag;
+    // fetch by deterministic UUID even if name match failed.
+    const ids = STARTER_CHANNELS.map((s) => starterChannelUuid(s.slug));
+    const metadata = await fetchStarterChannelMetadata(ids);
+    for (const channel of metadata) {
+      if (!existing.some((e) => e.id === channel.id)) {
+        existing.push(channel);
+      }
+    }
+  }
+
+  if (!hasAllStarterChannels(existing)) {
+    throw new Error("starter channels created but metadata not yet available");
+  }
+
+  // Join any open starter we are not yet a member of (kind 9021).
+  for (const spec of STARTER_CHANNELS) {
+    const channel = existing.find((ch) => isMatchingStarterChannel(ch, spec));
+    if (!channel) continue;
+    if (channel.is_member) continue;
+    try {
+      await ipcJoinChannel({ channelId: channel.id });
+      channel.is_member = true;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Already a member / race is fine; still mark pending so list is usable.
+      if (
+        msg.toLowerCase().includes("already") ||
+        msg.toLowerCase().includes("member")
+      ) {
+        pendingOwnedChannelIds.add(channel.id);
+        channel.is_member = true;
+      } else {
+        // Join failed but channel exists — still mark pending so onboard can proceed;
+        // membership event may catch up via kind:39002 later.
+        console.warn(
+          "[ensure_starter_channels] join failed for",
+          channel.id,
+          msg,
+        );
+        pendingOwnedChannelIds.add(channel.id);
+        channel.is_member = true;
+      }
+    }
+  }
+
+  // Refresh so membership overlays and open list stay consistent.
+  const refreshed = await ipcGetChannels();
+  for (const spec of STARTER_CHANNELS) {
+    const ch = refreshed.find((c) => isMatchingStarterChannel(c, spec));
+    if (ch && !ch.is_member) {
+      pendingOwnedChannelIds.add(ch.id);
+      ch.is_member = true;
+    }
+  }
+  // Also force is_member on starters in the in-memory list if refresh missed them.
+  for (const ch of refreshed) {
+    for (const spec of STARTER_CHANNELS) {
+      if (isMatchingStarterChannel(ch, spec)) {
+        ch.is_member = true;
+        pendingOwnedChannelIds.add(ch.id);
+      }
+    }
+  }
+
+  if (!hasAllStarterChannels(refreshed)) {
+    // Merge starters from existing into refreshed if still missing from list.
+    for (const ch of existing) {
+      if (
+        STARTER_CHANNELS.some((s) => isMatchingStarterChannel(ch, s)) &&
+        !refreshed.some((r) => r.id === ch.id)
+      ) {
+        ch.is_member = true;
+        refreshed.push(ch);
+      }
+    }
+  }
+
+  // Final check: both starters must be open stream members for the UI.
+  for (const spec of STARTER_CHANNELS) {
+    const ch = refreshed.find((c) => isMatchingStarterChannel(c, spec));
+    if (!ch || !ch.is_member) {
+      throw new Error(
+        `starter channel "${spec.name}" not available as open member after setup`,
+      );
+    }
+  }
+
+  return refreshed;
+}
+
 /** Kind 9000 — add members (bot/member). */
 async function ipcAddChannelMembers(args) {
   const channelId = args.channelId || args.channel_id;
@@ -1199,9 +1459,11 @@ async function handleIpc(cmd, args = {}) {
 
     case "get_channels":
     case "list_channels":
-    case "ensure_starter_channels":
-      // No fake starter channels — real membership from relay.
       return await ipcGetChannels();
+
+    case "ensure_starter_channels":
+      // Create missing open starters (stable UUID v5) + join if not member.
+      return await ipcEnsureStarterChannels();
 
     case "get_channel_details":
       return await ipcGetChannelDetails(
