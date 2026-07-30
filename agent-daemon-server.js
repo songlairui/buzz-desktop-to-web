@@ -32,6 +32,7 @@ const {
   nip19,
   nip44,
   generateSecretKey,
+  verifyEvent,
 } = requireDesktop("nostr-tools");
 
 /** Mirror desktop TIMELINE_KINDS minus huddle (voice out of scope). */
@@ -2214,6 +2215,528 @@ async function ipcListArchivedIdentities() {
   }
 }
 
+// ── Core messaging / membership / observer (batch fill “not implemented”) ───
+
+const HEX64 = /^[0-9a-f]{64}$/i;
+/** NIP-44 v2 ciphertext length envelope (matches buzz-core observer). */
+const NIP44_MIN_CONTENT_LEN = 132;
+const NIP44_MAX_CONTENT_LEN = 87472;
+const OBSERVER_MAX_PLAINTEXT_LEN = 65535;
+
+function requireChannelId(args) {
+  const channelId = args.channelId || args.channel_id;
+  if (!channelId || typeof channelId !== "string") {
+    throw new Error("channelId required");
+  }
+  return channelId;
+}
+
+function requireEventId(args, key = "eventId") {
+  const eventId = args[key] || args.event_id || args.eventId;
+  if (!eventId || !HEX64.test(String(eventId))) {
+    throw new Error(`${key} required (64-char hex)`);
+  }
+  return String(eventId).toLowerCase();
+}
+
+function parseCommandResponse(message) {
+  if (message == null) throw new Error("empty command response");
+  const text = String(message);
+  const jsonText = text.startsWith("response:")
+    ? text.slice("response:".length)
+    : text;
+  try {
+    return JSON.parse(jsonText);
+  } catch (err) {
+    throw new Error(
+      `expected 'response:' prefix or valid JSON, got: ${text.slice(0, 200)} (${err.message})`,
+    );
+  }
+}
+
+function contentLooksLikeNip44(content) {
+  const n = typeof content === "string" ? content.length : 0;
+  return n >= NIP44_MIN_CONTENT_LEN && n <= NIP44_MAX_CONTENT_LEN;
+}
+
+/**
+ * Kind 41010 — open (or surface) a DM. Relay returns
+ * `response:{"channel_id":"...","created":bool}` in the OK message.
+ */
+async function ipcOpenDm(args) {
+  const raw =
+    args.pubkeys ||
+    args.input?.pubkeys ||
+    args.participantPubkeys ||
+    args.participant_pubkeys ||
+    [];
+  if (!Array.isArray(raw) || raw.length === 0) {
+    throw new Error("open_dm requires at least one pubkey");
+  }
+  if (raw.length > 8) {
+    throw new Error("open_dm accepts at most 8 other participants");
+  }
+  const tags = [];
+  const seen = new Set();
+  for (const pk of raw) {
+    const hex = String(pk || "").trim().toLowerCase();
+    if (!HEX64.test(hex)) throw new Error(`invalid pubkey: ${pk}`);
+    if (seen.has(hex)) continue;
+    seen.add(hex);
+    tags.push(["p", hex]);
+  }
+  if (tags.length === 0) throw new Error("open_dm requires at least one pubkey");
+
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 41010,
+      created_at: Math.floor(Date.now() / 1000),
+      tags,
+      content: "",
+    },
+    sk,
+  );
+  const submitResult = await submitEvent(event);
+  if (submitResult && submitResult.accepted === false) {
+    throw new Error(
+      `relay rejected open_dm: ${submitResult.message || "unknown"}`,
+    );
+  }
+  const message =
+    (submitResult && submitResult.message) ||
+    (typeof submitResult === "string" ? submitResult : "");
+  let channelId = null;
+  try {
+    const ack = parseCommandResponse(message);
+    channelId = ack.channel_id || ack.channelId || null;
+  } catch (err) {
+    // Some relays may only return accepted without body — try membership probe.
+    console.warn("[open_dm] parse response failed:", err.message, message);
+  }
+  if (!channelId) {
+    throw new Error(
+      `open_dm: relay did not return channel_id (message=${String(message).slice(0, 200)})`,
+    );
+  }
+
+  pendingOwnedChannelIds.add(channelId);
+
+  // Poll kind:39000 like create_channel — metadata can lag slightly.
+  for (let i = 0; i < 12; i++) {
+    try {
+      const details = await ipcGetChannelDetails(channelId);
+      if (details && details.id) {
+        details.is_member = true;
+        return details;
+      }
+    } catch {
+      /* lag */
+    }
+    await sleep(200 + i * 80);
+  }
+
+  return {
+    id: channelId,
+    name: "",
+    channel_type: "dm",
+    visibility: "private",
+    description: "",
+    topic: null,
+    purpose: null,
+    member_count: tags.length + 1,
+    member_pubkeys: [hostPubkey(), ...tags.map((t) => t[1])],
+    last_message_at: null,
+    archived_at: null,
+    participants: [hostPubkey(), ...tags.map((t) => t[1])],
+    participant_pubkeys: [hostPubkey(), ...tags.map((t) => t[1])],
+    is_member: true,
+    ttl_seconds: null,
+    ttl_deadline: null,
+  };
+}
+
+/** Kind 41012 — hide DM from listing. */
+async function ipcHideDm(args) {
+  const channelId = requireChannelId(args);
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 41012,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [["h", channelId]],
+      content: "",
+    },
+    sk,
+  );
+  await submitEvent(event);
+  return true;
+}
+
+/** Kind 9022 — leave channel. */
+async function ipcLeaveChannel(args) {
+  const channelId = requireChannelId(args);
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 9022,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [["h", channelId]],
+      content: "",
+    },
+    sk,
+  );
+  await submitEvent(event);
+  pendingOwnedChannelIds.delete(channelId);
+  return true;
+}
+
+/** Kind 9001 — remove member. */
+async function ipcRemoveChannelMember(args) {
+  const channelId = requireChannelId(args);
+  const pubkey = String(args.pubkey || args.targetPubkey || "").trim().toLowerCase();
+  if (!HEX64.test(pubkey)) throw new Error("pubkey required");
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 9001,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [
+        ["h", channelId],
+        ["p", pubkey],
+      ],
+      content: "",
+    },
+    sk,
+  );
+  await submitEvent(event);
+  return true;
+}
+
+/** Kind 9000 with role — change member role (admin/member/guest/bot). */
+async function ipcChangeChannelMemberRole(args) {
+  const channelId = requireChannelId(args);
+  const pubkey = String(args.pubkey || args.targetPubkey || "").trim().toLowerCase();
+  const role = String(args.role || "").trim();
+  if (!HEX64.test(pubkey)) throw new Error("pubkey required");
+  if (!["admin", "member", "guest", "bot"].includes(role)) {
+    throw new Error(`invalid role: ${role}`);
+  }
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 9000,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [
+        ["h", channelId],
+        ["p", pubkey],
+        ["role", role],
+      ],
+      content: "",
+    },
+    sk,
+  );
+  await submitEvent(event);
+  return true;
+}
+
+/** Kind 7 — NIP-25 reaction (optional NIP-30 custom emoji). */
+async function ipcAddReaction(args) {
+  const eventId = requireEventId(args);
+  const emoji = String(args.emoji || "").trim();
+  if (!emoji) throw new Error("emoji required");
+  const emojiUrl = args.emojiUrl || args.emoji_url || null;
+  const tags = [["e", eventId]];
+  let content = emoji;
+  if (emojiUrl) {
+    // NIP-30: content is :shortcode: and emoji tag carries url.
+    const shortcode = emoji.replace(/^:|:$/g, "") || "custom";
+    content = `:${shortcode}:`;
+    tags.push(["emoji", shortcode, String(emojiUrl)]);
+  }
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 7,
+      created_at: Math.floor(Date.now() / 1000),
+      tags,
+      content,
+    },
+    sk,
+  );
+  await submitEvent(event);
+  return true;
+}
+
+/** Find our kind:7 and delete it (kind 5). */
+async function ipcRemoveReaction(args) {
+  const eventId = requireEventId(args);
+  const emoji = String(args.emoji || "").trim();
+  if (!emoji) throw new Error("emoji required");
+  const myPk = hostPubkey();
+  const reactions = await queryRelay([
+    { kinds: [7], "#e": [eventId], authors: [myPk], limit: 50 },
+  ]);
+  const match = reactions.find((ev) => String(ev.content || "").trim() === emoji);
+  if (!match) {
+    throw new Error("could not find your reaction event for this emoji");
+  }
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 5,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [["e", match.id]],
+      content: "",
+    },
+    sk,
+  );
+  await submitEvent(event);
+  return true;
+}
+
+/** Kind 40003 — edit message. */
+async function ipcEditMessage(args) {
+  const channelId = requireChannelId(args);
+  const eventId = requireEventId(args);
+  const content = args.content != null ? String(args.content) : "";
+  const mediaTags = args.mediaTags || args.media_tags || [];
+  const emojiTags = args.emojiTags || args.emoji_tags || [];
+  const mentions = args.mentionPubkeys || args.mention_pubkeys || [];
+  if (!content.trim() && (!Array.isArray(mediaTags) || mediaTags.length === 0)) {
+    throw new Error("edit must have content or attachments");
+  }
+  const tags = [
+    ["h", channelId],
+    ["e", eventId],
+  ];
+  for (const p of mentions) {
+    if (p && HEX64.test(String(p))) tags.push(["p", String(p).toLowerCase()]);
+  }
+  if (Array.isArray(mediaTags)) {
+    for (const imeta of mediaTags) {
+      if (Array.isArray(imeta) && imeta.length) tags.push(imeta.map(String));
+    }
+  }
+  if (Array.isArray(emojiTags)) {
+    for (const et of emojiTags) {
+      if (Array.isArray(et) && et.length) tags.push(et.map(String));
+    }
+  }
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 40003,
+      created_at: Math.floor(Date.now() / 1000),
+      tags,
+      content,
+    },
+    sk,
+  );
+  await submitEvent(event);
+  return true;
+}
+
+/** Kind 5 — delete message (channel-scoped). */
+async function ipcDeleteMessage(args) {
+  const channelId = requireChannelId(args);
+  const eventId = requireEventId(args);
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 5,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [
+        ["h", channelId],
+        ["e", eventId],
+      ],
+      content: "",
+    },
+    sk,
+  );
+  await submitEvent(event);
+  return true;
+}
+
+/** Kind 9002 — archive / unarchive channel. */
+async function ipcArchiveChannel(args, archived) {
+  const channelId = requireChannelId(args);
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 9002,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [
+        ["h", channelId],
+        ["archived", archived ? "true" : "false"],
+      ],
+      content: "",
+    },
+    sk,
+  );
+  await submitEvent(event);
+  return true;
+}
+
+/** Kind 9008 — delete channel. */
+async function ipcDeleteChannel(args) {
+  const channelId = requireChannelId(args);
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 9008,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [["h", channelId]],
+      content: "",
+    },
+    sk,
+  );
+  await submitEvent(event);
+  return true;
+}
+
+/** Kind 9002 — set topic / purpose tags. */
+async function ipcSetChannelTopic(args) {
+  const channelId = requireChannelId(args);
+  const topic = args.topic != null ? String(args.topic) : "";
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 9002,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [
+        ["h", channelId],
+        ["topic", topic],
+      ],
+      content: "",
+    },
+    sk,
+  );
+  await submitEvent(event);
+  return true;
+}
+
+async function ipcSetChannelPurpose(args) {
+  const channelId = requireChannelId(args);
+  const purpose = args.purpose != null ? String(args.purpose) : "";
+  const sk = loadSecretKeyBytes();
+  const event = finalizeEvent(
+    {
+      kind: 9002,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [
+        ["h", channelId],
+        ["purpose", purpose],
+      ],
+      content: "",
+    },
+    sk,
+  );
+  await submitEvent(event);
+  return true;
+}
+
+/**
+ * Decrypt kind:24200 observer frame content with host seckey (owner key).
+ * Args: { eventJson: string } — full event JSON.
+ */
+function ipcDecryptObserverEvent(args) {
+  const eventJson = args.eventJson || args.event_json;
+  if (typeof eventJson !== "string" || !eventJson.trim()) {
+    throw new Error("eventJson required");
+  }
+  let event;
+  try {
+    event = JSON.parse(eventJson);
+  } catch (err) {
+    throw new Error(`invalid event: ${err.message}`);
+  }
+  if (!event || typeof event !== "object") {
+    throw new Error("invalid event: not an object");
+  }
+  if (typeof verifyEvent === "function") {
+    try {
+      if (!verifyEvent(event)) {
+        throw new Error("observer event has invalid ID or signature");
+      }
+    } catch (err) {
+      if (String(err.message || "").includes("invalid ID")) throw err;
+      // verifyEvent may throw on malformed — surface clearly
+      throw new Error(`observer event verification failed: ${err.message}`);
+    }
+  }
+  if (!contentLooksLikeNip44(event.content)) {
+    throw new Error(
+      `invalid NIP-44 ciphertext length: ${String(event.content || "").length}`,
+    );
+  }
+  const sk = loadSecretKeyBytes();
+  const senderPk = String(event.pubkey || "").toLowerCase();
+  if (!HEX64.test(senderPk)) throw new Error("observer event missing pubkey");
+  const conversationKey = nip44.v2.utils.getConversationKey(sk, senderPk);
+  let plaintext;
+  try {
+    plaintext = nip44.v2.decrypt(event.content, conversationKey);
+  } catch (err) {
+    throw new Error(`decrypt observer event failed: ${err.message}`);
+  }
+  if (plaintext.length > OBSERVER_MAX_PLAINTEXT_LEN) {
+    throw new Error(
+      `observer plaintext exceeds ${OBSERVER_MAX_PLAINTEXT_LEN} bytes (got ${plaintext.length})`,
+    );
+  }
+  try {
+    return JSON.parse(plaintext);
+  } catch (err) {
+    throw new Error(`observer payload JSON error: ${err.message}`);
+  }
+}
+
+/**
+ * Build signed kind:24200 control frame (owner → agent).
+ * Returns event JSON string (Tauri parity).
+ */
+function ipcBuildObserverControlEvent(args) {
+  const agentPubkey = String(
+    args.agentPubkey || args.agent_pubkey || "",
+  )
+    .trim()
+    .toLowerCase();
+  if (!HEX64.test(agentPubkey)) throw new Error("invalid agent pubkey");
+  const payload = args.payload;
+  if (payload === undefined) throw new Error("payload required");
+
+  let plaintext = JSON.stringify(payload);
+  if (plaintext.length > OBSERVER_MAX_PLAINTEXT_LEN) {
+    throw new Error(
+      `observer plaintext exceeds ${OBSERVER_MAX_PLAINTEXT_LEN} bytes (got ${plaintext.length})`,
+    );
+  }
+  const sk = loadSecretKeyBytes();
+  const conversationKey = nip44.v2.utils.getConversationKey(sk, agentPubkey);
+  const encrypted = nip44.v2.encrypt(plaintext, conversationKey);
+  plaintext = ""; // drop cleartext reference
+  if (!contentLooksLikeNip44(encrypted)) {
+    throw new Error("encrypt observer control produced invalid NIP-44 length");
+  }
+
+  // Control frames: p + agent both point at agent (desktop build_observer_control_event).
+  const event = finalizeEvent(
+    {
+      kind: 24200,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [
+        ["p", agentPubkey],
+        ["agent", agentPubkey],
+        ["frame", "control"],
+      ],
+      content: encrypted,
+    },
+    sk,
+  );
+  return JSON.stringify(event);
+}
+
 // ── ACP runtime discovery (Settings → Agents / harness catalog) ─────────────
 // Desktop probes PATH for known harness CLIs and returns AcpRuntimeCatalogEntry.
 // Web host must do the same on the Fedora machine — not hardcode fake "available".
@@ -3013,6 +3536,46 @@ async function handleIpc(cmd, args = {}) {
 
     case "update_channel":
       return await ipcUpdateChannel(args.input || args);
+
+    // ── DMs / membership / messages / reactions (core product path) ──
+    case "open_dm":
+      return await ipcOpenDm(
+        args.input && typeof args.input === "object"
+          ? { ...args, ...args.input }
+          : args,
+      );
+    case "hide_dm":
+      return await ipcHideDm(args);
+    case "leave_channel":
+      return await ipcLeaveChannel(args);
+    case "remove_channel_member":
+      return await ipcRemoveChannelMember(args);
+    case "change_channel_member_role":
+      return await ipcChangeChannelMemberRole(args);
+    case "add_reaction":
+      return await ipcAddReaction(args);
+    case "remove_reaction":
+      return await ipcRemoveReaction(args);
+    case "edit_message":
+      return await ipcEditMessage(args);
+    case "delete_message":
+      return await ipcDeleteMessage(args);
+    case "archive_channel":
+      return await ipcArchiveChannel(args, true);
+    case "unarchive_channel":
+      return await ipcArchiveChannel(args, false);
+    case "delete_channel":
+      return await ipcDeleteChannel(args);
+    case "set_channel_topic":
+      return await ipcSetChannelTopic(args);
+    case "set_channel_purpose":
+      return await ipcSetChannelPurpose(args);
+
+    // ── Agent observer (ACP activity pane) ──
+    case "decrypt_observer_event":
+      return ipcDecryptObserverEvent(args);
+    case "build_observer_control_event":
+      return ipcBuildObserverControlEvent(args);
 
     case "get_profile":
     case "get_user_profile":

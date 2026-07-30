@@ -424,13 +424,35 @@ export async function invoke<T = unknown>(
     case "join_channel":
     case "add_channel_members":
     case "update_channel":
+    case "open_dm":
+    case "hide_dm":
+    case "remove_channel_member":
+    case "change_channel_member_role":
+    case "leave_channel":
+    case "add_reaction":
+    case "remove_reaction":
+    case "edit_message":
+    case "delete_message":
+    case "archive_channel":
+    case "unarchive_channel":
+    case "delete_channel":
+    case "set_channel_topic":
+    case "set_channel_purpose":
       return (await hostIpc(cmd, args)) as T;
 
-    // Not yet on host
-    case "open_dm":
-    case "remove_channel_member":
-    case "leave_channel":
-      throw new Error(`${cmd} not implemented on host web yet`);
+    // Agent ACP activity: decrypt live/archived 24200 frames; build control frames.
+    case "decrypt_observer_event":
+      return (await hostIpc(cmd, args)) as T;
+
+    case "build_observer_control_event": {
+      const data = await hostIpc<string | Record<string, unknown>>(cmd, args);
+      // Tauri returns JSON string of the signed event.
+      if (typeof data === "string") return data as unknown as T;
+      if (data && typeof data === "object") {
+        return JSON.stringify(data) as unknown as T;
+      }
+      throw new Error("build_observer_control_event: unexpected host response");
+    }
 
     case "get_canvas":
       return null as unknown as T;
