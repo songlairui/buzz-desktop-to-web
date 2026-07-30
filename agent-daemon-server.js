@@ -369,8 +369,8 @@ function importHostIdentityFromNsec(nsecRaw) {
 
 // ── NIP-98 + relay HTTP ─────────────────────────────────────────────────────
 
-function buildNip98Auth(method, url, bodyBuf) {
-  const sk = loadSecretKeyBytes();
+function buildNip98Auth(method, url, bodyBuf, seckeyBytes = null) {
+  const sk = seckeyBytes || loadSecretKeyBytes();
   const payload = crypto.createHash("sha256").update(bodyBuf).digest("hex");
   const event = finalizeEvent(
     {
@@ -409,14 +409,18 @@ async function queryRelay(filters) {
   return data;
 }
 
-async function submitEvent(event) {
+/**
+ * Submit a signed event. When `authSeckeyBytes` is set, NIP-98 AUTH uses that
+ * key (required for agent kind:0 — event.pubkey must match AUTH pubkey).
+ */
+async function submitEvent(event, authSeckeyBytes = null) {
   const url = `${RELAY_HTTP}/events`;
   const bodyBuf = Buffer.from(JSON.stringify(event));
   const res = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: buildNip98Auth("POST", url, bodyBuf),
+      Authorization: buildNip98Auth("POST", url, bodyBuf, authSeckeyBytes),
     },
     body: bodyBuf,
   });
@@ -1838,6 +1842,7 @@ function stopManagedAgentProcess(pubkey) {
 
 /**
  * Publish kind:0 profile for an arbitrary seckey (host human or agent).
+ * AUTH must use the same key that signed the event.
  */
 async function publishKind0Profile(seckeyHex, profile) {
   const sk = hexToBytes(seckeyHex);
@@ -1864,7 +1869,7 @@ async function publishKind0Profile(seckeyHex, profile) {
     },
     sk,
   );
-  await submitEvent(event);
+  await submitEvent(event, sk);
   return event;
 }
 
