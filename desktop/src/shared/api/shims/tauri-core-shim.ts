@@ -543,6 +543,11 @@ export async function invoke<T = unknown>(
     case "observer_archive_default_enabled":
       return false as unknown as T;
 
+    // Web host is bound to the local relay; skip empty-community WelcomeSetup
+    // and auto-seed the default relay as first community (non-local hosts only).
+    case "auto_connect_default_relay_enabled":
+      return true as unknown as T;
+
     case "apply_workspace":
     case "set_prevent_sleep_active":
       return true as unknown as T;
