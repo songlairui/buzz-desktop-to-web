@@ -287,8 +287,8 @@ export async function invoke<T = unknown>(
       return (await hostIpc(cmd, args)) as T;
 
     case "update_profile":
-      // Profile write not wired yet — return current host profile shape.
-      return (await hostIpc("get_profile", args)) as T;
+      // Publish kind:0 on the relay so other clients see display_name.
+      return (await hostIpc("update_profile", args)) as T;
 
     case "get_users_batch":
       return (await hostIpc("get_users_batch", args)) as T;

@@ -1704,12 +1704,472 @@ function ipcUpdateManagedAgent(args) {
 function ipcDeleteManagedAgent(args) {
   const pubkey = String(args.pubkey || "").trim().toLowerCase();
   if (!pubkey) throw new Error("pubkey required");
+  // Stop process first if running.
+  try {
+    stopManagedAgentProcess(pubkey);
+  } catch {
+    /* ignore */
+  }
   const store = loadManagedAgentsStore();
   store.agents = store.agents.filter(
     (a) => String(a.pubkey).toLowerCase() !== pubkey,
   );
   saveManagedAgentsStore(store);
   return true;
+}
+
+// ── Managed agent process runtime (start/stop buzz-acp) ─────────────────────
+/** @type {Map<string, { child: import('child_process').ChildProcess, logPath: string }>} */
+const runningAgentProcesses = new Map();
+
+function isPidAlive(pid) {
+  if (!pid || typeof pid !== "number") return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function resolveAgentCommandPath(agentCommand) {
+  const raw = String(agentCommand || "").trim();
+  if (!raw) throw new Error("agent_command is empty");
+  if (raw.includes("/") || raw.startsWith(".")) {
+    if (fs.existsSync(raw)) return path.resolve(raw);
+  }
+  // Common host aliases
+  if (raw === "pi-acp-wrapper.js" || raw.endsWith("/pi-acp-wrapper.js")) {
+    const wrapper = path.join(__dirname, "pi-acp-wrapper.js");
+    if (fs.existsSync(wrapper)) return wrapper;
+  }
+  if (raw === "buzz-acp" || raw === "buzz-agent") {
+    const release = path.join(__dirname, "target/release/buzz-acp");
+    if (fs.existsSync(release)) return release;
+  }
+  const onPath = resolveCommandOnPath(raw);
+  if (onPath) return onPath;
+  // Last resort: treat as bare command name for exec (PATH at spawn time)
+  return raw;
+}
+
+function resolveBuzzAcpBinary() {
+  const release = path.join(__dirname, "target/release/buzz-acp");
+  if (fs.existsSync(release)) return release;
+  const debug = path.join(__dirname, "target/debug/buzz-acp");
+  if (fs.existsSync(debug)) return debug;
+  const onPath = resolveCommandOnPath("buzz-acp");
+  if (onPath) return onPath;
+  throw new Error(
+    "buzz-acp binary not found (expected target/release/buzz-acp)",
+  );
+}
+
+function personaSystemPrompt(personaId) {
+  if (!personaId) return null;
+  const personas = loadPersonas();
+  const p = personas.find((x) => x.id === personaId);
+  return p?.system_prompt || null;
+}
+
+function syncManagedAgentRuntimeStatus(record) {
+  const pk = String(record.pubkey).toLowerCase();
+  const tracked = runningAgentProcesses.get(pk);
+  if (tracked && tracked.child && !tracked.child.killed) {
+    const pid = tracked.child.pid;
+    if (isPidAlive(pid)) {
+      record.status = "running";
+      record.pid = pid;
+      return record;
+    }
+    runningAgentProcesses.delete(pk);
+  }
+  if (record.pid && isPidAlive(record.pid)) {
+    record.status = "running";
+    return record;
+  }
+  if (record.status === "running") {
+    record.status = "stopped";
+    record.pid = null;
+    record.last_stopped_at = isoNow();
+  }
+  return record;
+}
+
+function stopManagedAgentProcess(pubkey) {
+  const pk = String(pubkey).toLowerCase();
+  const tracked = runningAgentProcesses.get(pk);
+  if (tracked?.child && !tracked.child.killed) {
+    try {
+      tracked.child.kill("SIGTERM");
+    } catch {
+      /* ignore */
+    }
+    // Force kill after short grace
+    setTimeout(() => {
+      try {
+        if (tracked.child && !tracked.child.killed) {
+          tracked.child.kill("SIGKILL");
+        }
+      } catch {
+        /* ignore */
+      }
+    }, 3000);
+  }
+  runningAgentProcesses.delete(pk);
+
+  const store = loadManagedAgentsStore();
+  const idx = store.agents.findIndex(
+    (a) => String(a.pubkey).toLowerCase() === pk,
+  );
+  if (idx >= 0) {
+    store.agents[idx] = {
+      ...store.agents[idx],
+      status: "stopped",
+      pid: null,
+      last_stopped_at: isoNow(),
+      updated_at: isoNow(),
+    };
+    saveManagedAgentsStore(store);
+    return store.agents[idx];
+  }
+  return null;
+}
+
+/**
+ * Publish kind:0 profile for an arbitrary seckey (host human or agent).
+ */
+async function publishKind0Profile(seckeyHex, profile) {
+  const sk = hexToBytes(seckeyHex);
+  const content = {};
+  if (profile.display_name || profile.displayName) {
+    content.display_name = profile.display_name || profile.displayName;
+  }
+  if (profile.name) content.name = profile.name;
+  if (profile.picture || profile.avatar_url || profile.avatarUrl) {
+    content.picture =
+      profile.picture || profile.avatar_url || profile.avatarUrl;
+  }
+  if (profile.about) content.about = profile.about;
+  if (profile.nip05 || profile.nip05_handle) {
+    content.nip05 = profile.nip05 || profile.nip05_handle;
+  }
+  if (profile.bot === true) content.bot = true;
+  const event = finalizeEvent(
+    {
+      kind: 0,
+      created_at: Math.floor(Date.now() / 1000),
+      tags: [],
+      content: JSON.stringify(content),
+    },
+    sk,
+  );
+  await submitEvent(event);
+  return event;
+}
+
+/** Ensure host human identity has a relay kind:0 so other clients show a name. */
+async function ensureHostProfilePublished() {
+  const id = getHostIdentity();
+  const events = await queryRelay([
+    { kinds: [0], authors: [id.pubkey], limit: 1 },
+  ]);
+  if (events[0]) {
+    // Already published — optionally refresh display_name if empty
+    try {
+      const content = JSON.parse(events[0].content || "{}");
+      if (content.display_name || content.name) return profileFromKind0(events[0]);
+    } catch {
+      /* republish */
+    }
+  }
+  const seckeyHex = loadSecretKeyHex();
+  const display =
+    id.display_name || process.env.BUZZ_WEB_DISPLAY_NAME || "fedora";
+  const username = id.username || process.env.BUZZ_WEB_USERNAME || "fedora";
+  await publishKind0Profile(seckeyHex, {
+    display_name: display,
+    name: username,
+    about: "Fedora host identity (Buzz Web)",
+  });
+  return {
+    pubkey: id.pubkey,
+    display_name: display,
+    avatar_url: null,
+    about: "Fedora host identity (Buzz Web)",
+    nip05_handle: null,
+    owner_pubkey: id.owner_pubkey,
+    has_profile_event: true,
+  };
+}
+
+async function ensureAgentProfilePublished(record) {
+  if (!record.seckey_hex) return null;
+  const events = await queryRelay([
+    { kinds: [0], authors: [record.pubkey], limit: 1 },
+  ]);
+  if (events[0]) {
+    try {
+      const content = JSON.parse(events[0].content || "{}");
+      if (content.display_name || content.name) return events[0];
+    } catch {
+      /* republish */
+    }
+  }
+  return publishKind0Profile(record.seckey_hex, {
+    display_name: record.name,
+    name: record.name,
+    about: record.system_prompt
+      ? String(record.system_prompt).slice(0, 280)
+      : `Buzz managed agent (${record.persona_id || "custom"})`,
+    bot: true,
+    avatar_url: record.avatar_url,
+  });
+}
+
+function ipcStartManagedAgent(args) {
+  const pubkey = String(args.pubkey || "").trim().toLowerCase();
+  if (!pubkey) throw new Error("pubkey required");
+
+  const store = loadManagedAgentsStore();
+  const idx = store.agents.findIndex(
+    (a) => String(a.pubkey).toLowerCase() === pubkey,
+  );
+  if (idx < 0) throw new Error(`managed agent not found: ${pubkey}`);
+  let record = store.agents[idx];
+  record = syncManagedAgentRuntimeStatus(record);
+
+  if (record.status === "running" && record.pid && isPidAlive(record.pid)) {
+    store.agents[idx] = record;
+    saveManagedAgentsStore(store);
+    return managedAgentSummary(record);
+  }
+
+  if (!record.seckey_hex) {
+    throw new Error(
+      "agent has no seckey_hex on host — recreate the managed agent",
+    );
+  }
+
+  const buzzAcp = resolveBuzzAcpBinary();
+  let agentCommand = resolveAgentCommandPath(
+    record.agent_command || "pi-acp-wrapper.js",
+  );
+  // If agent_command accidentally points at buzz-acp itself, fall back to pi wrapper
+  if (
+    agentCommand.endsWith("/buzz-acp") ||
+    path.basename(agentCommand) === "buzz-acp"
+  ) {
+    agentCommand = resolveAgentCommandPath("pi-acp-wrapper.js");
+  }
+
+  let agentArgs = Array.isArray(record.agent_args) ? record.agent_args.slice() : [];
+  // pi-acp-wrapper is already an ACP server — don't append bare "acp"
+  if (
+    path.basename(agentCommand) === "pi-acp-wrapper.js" &&
+    agentArgs.length === 1 &&
+    agentArgs[0] === "acp"
+  ) {
+    agentArgs = [];
+  }
+  // grok default args if someone stored empty args for grok harness
+  if (
+    (path.basename(agentCommand) === "grok" || record.runtime === "grok") &&
+    agentArgs.length === 0
+  ) {
+    agentArgs = ["agent", "--always-approve", "stdio"];
+  }
+
+  const envFile = getEnvConfig();
+  const ownerPk =
+    process.env.BUZZ_ACP_AGENT_OWNER ||
+    envFile.BUZZ_ACP_AGENT_OWNER ||
+    hostPubkey();
+  const systemPrompt =
+    record.system_prompt ||
+    personaSystemPrompt(record.persona_id) ||
+    undefined;
+  const model =
+    record.model ||
+    envFile.BUZZ_ACP_MODEL ||
+    envFile.GOOSE_MODEL ||
+    envFile.BUZZ_AGENT_MODEL ||
+    "grok-4.5";
+  const provider =
+    record.provider ||
+    envFile.GOOSE_PROVIDER ||
+    envFile.BUZZ_AGENT_PROVIDER ||
+    "openai";
+
+  const logPath =
+    record.log_path || `/tmp/buzz-acp-${record.pubkey.slice(0, 12)}.log`;
+  const logFd = fs.openSync(logPath, "a");
+
+  const childEnv = {
+    ...process.env,
+    PATH: hostSearchPath(),
+    BUZZ_RELAY_URL: record.relay_url || RELAY_WS,
+    BUZZ_RELAY_HTTP: RELAY_HTTP,
+    BUZZ_PRIVATE_KEY: record.seckey_hex,
+    BUZZ_ACP_AGENT_OWNER: ownerPk,
+    BUZZ_ACP_RESPOND_TO: record.respond_to || "owner-only",
+    BUZZ_ACP_AGENT_COMMAND: agentCommand,
+    OPENAI_BASE_URL: envFile.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL,
+    OPENAI_API_KEY: envFile.OPENAI_API_KEY || process.env.OPENAI_API_KEY,
+    BUZZ_ACP_MODEL: model,
+    BUZZ_AGENT_MODEL: model,
+    GOOSE_MODEL: model,
+    BUZZ_AGENT_PROVIDER: provider,
+    GOOSE_PROVIDER: provider,
+    ...(record.env_vars || {}),
+  };
+  if (systemPrompt) {
+    childEnv.BUZZ_ACP_SYSTEM_PROMPT = systemPrompt;
+  }
+  if (
+    Array.isArray(record.respond_to_allowlist) &&
+    record.respond_to_allowlist.length
+  ) {
+    childEnv.BUZZ_ACP_RESPOND_TO_ALLOWLIST =
+      record.respond_to_allowlist.join(",");
+  }
+
+  const cliArgs = [
+    "--private-key",
+    record.seckey_hex,
+    "--relay-url",
+    record.relay_url || RELAY_WS,
+    "--agent-owner",
+    ownerPk,
+    "--agent-command",
+    agentCommand,
+    "--respond-to",
+    record.respond_to || "owner-only",
+  ];
+  for (const a of agentArgs) {
+    cliArgs.push("--agent-args", String(a));
+  }
+  if (systemPrompt) {
+    cliArgs.push("--system-prompt", systemPrompt);
+  }
+
+  const child = require("child_process").spawn(buzzAcp, cliArgs, {
+    env: childEnv,
+    detached: false,
+    stdio: ["ignore", logFd, logFd],
+  });
+
+  fs.closeSync(logFd);
+
+  if (!child.pid) {
+    throw new Error(`failed to spawn buzz-acp for ${record.name}`);
+  }
+
+  runningAgentProcesses.set(pubkey, { child, logPath });
+  child.on("exit", (code, signal) => {
+    const cur = runningAgentProcesses.get(pubkey);
+    if (cur && cur.child === child) {
+      runningAgentProcesses.delete(pubkey);
+    }
+    try {
+      const s = loadManagedAgentsStore();
+      const i = s.agents.findIndex(
+        (a) => String(a.pubkey).toLowerCase() === pubkey,
+      );
+      if (i >= 0 && s.agents[i].pid === child.pid) {
+        s.agents[i] = {
+          ...s.agents[i],
+          status: "stopped",
+          pid: null,
+          last_stopped_at: isoNow(),
+          last_exit_code: code,
+          last_error:
+            code && code !== 0
+              ? `buzz-acp exited code=${code} signal=${signal || ""}`
+              : null,
+          updated_at: isoNow(),
+        };
+        saveManagedAgentsStore(s);
+      }
+    } catch (err) {
+      console.warn("agent exit status update failed:", err.message);
+    }
+  });
+
+  const now = isoNow();
+  record = {
+    ...record,
+    status: "running",
+    pid: child.pid,
+    last_started_at: now,
+    last_error: null,
+    last_error_code: null,
+    log_path: logPath,
+    agent_command: agentCommand,
+    agent_args: agentArgs,
+    model,
+    provider,
+    system_prompt: systemPrompt || record.system_prompt,
+    updated_at: now,
+  };
+  store.agents[idx] = record;
+  saveManagedAgentsStore(store);
+
+  // Fire-and-forget profile publish for agent + host
+  ensureAgentProfilePublished(record).catch((err) =>
+    console.warn("agent profile publish failed:", err.message),
+  );
+  ensureHostProfilePublished().catch((err) =>
+    console.warn("host profile publish failed:", err.message),
+  );
+
+  console.log(
+    `[start_managed_agent] ${record.name} pid=${child.pid} cmd=${agentCommand} log=${logPath}`,
+  );
+  return managedAgentSummary(record);
+}
+
+function ipcStopManagedAgent(args) {
+  const pubkey = String(args.pubkey || "").trim().toLowerCase();
+  if (!pubkey) throw new Error("pubkey required");
+  const stopped = stopManagedAgentProcess(pubkey);
+  if (!stopped) {
+    // Still return a summary shape if possible
+    const store = loadManagedAgentsStore();
+    const rec = store.agents.find(
+      (a) => String(a.pubkey).toLowerCase() === pubkey,
+    );
+    if (!rec) throw new Error(`managed agent not found: ${pubkey}`);
+    return managedAgentSummary(rec);
+  }
+  return managedAgentSummary(stopped);
+}
+
+async function ipcUpdateProfile(args) {
+  const input = args.input || args;
+  const seckeyHex = loadSecretKeyHex();
+  const current = await ipcGetProfile(hostPubkey());
+  const display_name =
+    input.displayName ??
+    input.display_name ??
+    current.display_name ??
+    "fedora";
+  const name = input.name ?? current.username ?? display_name;
+  const about =
+    input.about ?? current.about ?? "Fedora host identity (Buzz Web)";
+  const avatar_url =
+    input.avatarUrl ?? input.avatar_url ?? current.avatar_url ?? null;
+  const nip05 =
+    input.nip05Handle ?? input.nip05_handle ?? current.nip05_handle ?? null;
+
+  await publishKind0Profile(seckeyHex, {
+    display_name,
+    name,
+    about,
+    avatar_url,
+    nip05,
+  });
+  return ipcGetProfile(hostPubkey());
 }
 
 /** NIP-44 encrypt/decrypt to self (read-state snapshots). */
@@ -2560,8 +3020,18 @@ async function handleIpc(cmd, args = {}) {
       return await ipcListRelayAgents();
 
     case "list_managed_agents":
-    case "get_managed_agents":
+    case "get_managed_agents": {
+      // Refresh process liveness before listing
+      const store = loadManagedAgentsStore();
+      let changed = false;
+      for (let i = 0; i < store.agents.length; i++) {
+        const before = store.agents[i].status;
+        store.agents[i] = syncManagedAgentRuntimeStatus(store.agents[i]);
+        if (store.agents[i].status !== before) changed = true;
+      }
+      if (changed) saveManagedAgentsStore(store);
       return ipcListManagedAgents();
+    }
 
     case "create_managed_agent":
       return ipcCreateManagedAgent(args);
@@ -2571,6 +3041,18 @@ async function handleIpc(cmd, args = {}) {
 
     case "delete_managed_agent":
       return ipcDeleteManagedAgent(args);
+
+    case "start_managed_agent":
+      return ipcStartManagedAgent(args);
+
+    case "stop_managed_agent":
+      return ipcStopManagedAgent(args);
+
+    case "update_profile":
+      return await ipcUpdateProfile(args);
+
+    case "ensure_host_profile":
+      return await ensureHostProfilePublished();
 
     case "list_archived_identities":
       return await ipcListArchivedIdentities();
