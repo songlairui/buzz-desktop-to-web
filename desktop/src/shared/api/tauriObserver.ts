@@ -19,3 +19,29 @@ export async function buildObserverControlEvent(input: {
   });
   return JSON.parse(eventJson) as RelayEvent;
 }
+
+/**
+ * Host-side ring buffer of recent kind:24200 frames (web only).
+ * Desktop archive covers history; web has no SQLite save-subscription path,
+ * so mid-turn Activity opens would otherwise see an empty transcript.
+ */
+export async function listBufferedObserverEvents(options?: {
+  since?: number;
+  agentPubkey?: string | null;
+  limit?: number;
+}): Promise<RelayEvent[]> {
+  try {
+    const response = await invokeTauri<{ events?: RelayEvent[] }>(
+      "list_buffered_observer_events",
+      {
+        since: options?.since ?? null,
+        agentPubkey: options?.agentPubkey ?? null,
+        limit: options?.limit ?? 500,
+      },
+    );
+    return Array.isArray(response?.events) ? response.events : [];
+  } catch {
+    // Desktop / older host: command missing — treat as empty.
+    return [];
+  }
+}

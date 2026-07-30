@@ -1279,6 +1279,39 @@ async fn handle_kind0_profile(
         }
     }
 
+    // Materialize NIP-OA agent→owner from the kind:0 auth tag when present.
+    // AUTH with BUZZ_AUTH_TAG also does this, but web-host agents historically
+    // published only kind:0 owner attestation and never set BUZZ_AUTH_TAG —
+    // leaving users.agent_owner_pubkey NULL so kind:24200 observer frames
+    // were rejected ("not authorized for this agent owner").
+    let kind0_auth_tag_json = event.tags.iter().find_map(|tag| {
+        let parts = tag.as_slice();
+        if parts.first().map(|s| s.as_str()) == Some("auth") && parts.len() == 4 {
+            serde_json::to_string(&parts).ok()
+        } else {
+            None
+        }
+    });
+    if let Some(owner) = crate::api::relay_members::extract_nip_oa_owner(
+        &pubkey_bytes,
+        kind0_auth_tag_json.as_deref(),
+    ) {
+        if crate::api::relay_members::materialize_nip_oa_owner(
+            state,
+            tenant,
+            &event.pubkey,
+            &owner,
+        )
+        .await
+        {
+            info!(
+                agent = %hex::encode(&pubkey_bytes),
+                owner = %owner.to_hex(),
+                "kind:0 NIP-OA owner materialized"
+            );
+        }
+    }
+
     info!(pubkey = %hex::encode(&pubkey_bytes), "kind:0 profile synced to users table");
     Ok(())
 }

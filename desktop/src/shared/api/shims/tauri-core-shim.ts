@@ -426,6 +426,11 @@ export async function invoke<T = unknown>(
     case "get_channel_window":
       return (await hostIpc("get_channel_window", args)) as T;
 
+    // Thread panel deep-link / open-thread: server-side reply subtree.
+    // Must not fall through to the empty-object default path.
+    case "get_thread_replies":
+      return (await hostIpc("get_thread_replies", args)) as T;
+
     case "get_event": {
       const data = await hostIpc<string | Record<string, unknown>>(
         "get_event",
@@ -468,6 +473,9 @@ export async function invoke<T = unknown>(
     // Agent ACP activity: decrypt live/archived 24200 frames; build control frames.
     case "decrypt_observer_event":
       return (await hostIpc(cmd, args)) as T;
+
+    case "list_buffered_observer_events":
+      return (await hostIpc("list_buffered_observer_events", args)) as T;
 
     case "build_observer_control_event": {
       const data = await hostIpc<string | Record<string, unknown>>(cmd, args);

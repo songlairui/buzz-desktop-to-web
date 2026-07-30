@@ -73,6 +73,40 @@ test("row 4: create input never contains definition env vars", async () => {
   );
 });
 
+test("mint: definition respondTo is copied onto create input", async () => {
+  const anyone = await buildInstanceInputForDefinition(
+    persona({ respondTo: "anyone", respondToAllowlist: [] }),
+    gooseRuntime,
+  );
+  assert.equal(anyone.respondTo, "anyone");
+  assert.equal(
+    "respondToAllowlist" in anyone,
+    false,
+    "anyone mode must not seed an allowlist",
+  );
+
+  const allow = "a".repeat(64);
+  const allowlist = await buildInstanceInputForDefinition(
+    persona({
+      respondTo: "allowlist",
+      respondToAllowlist: [allow],
+    }),
+    gooseRuntime,
+  );
+  assert.equal(allowlist.respondTo, "allowlist");
+  assert.deepEqual(allowlist.respondToAllowlist, [allow]);
+
+  const unset = await buildInstanceInputForDefinition(
+    persona({ respondTo: null }),
+    gooseRuntime,
+  );
+  assert.equal(
+    "respondTo" in unset,
+    false,
+    "unset definition respondTo must stay silent so mint defaults apply",
+  );
+});
+
 test("row 2: harnessOverride follows the backend-aligned formula", async () => {
   const match = await buildInstanceInputForDefinition(
     persona({ runtime: "goose" }),

@@ -125,6 +125,22 @@ export async function buildInstanceInputForDefinition(
     avatarUrl,
   };
 
+  // Mint-time inbound gate: pass definition defaults so create_managed_agent
+  // (desktop mint + web-host) does not fall back to owner-only when the
+  // persona was configured as anyone/allowlist. Desktop also re-reads the
+  // linked persona when input is silent; web-host historically did not, so
+  // the create payload must carry the values.
+  const respondTo =
+    persona.respondTo === "owner-only" ||
+    persona.respondTo === "allowlist" ||
+    persona.respondTo === "anyone"
+      ? persona.respondTo
+      : undefined;
+  const respondToAllowlist =
+    respondTo === "allowlist"
+      ? [...(persona.respondToAllowlist ?? [])]
+      : undefined;
+
   if (backendIntent?.type === "provider") {
     return {
       ...base,
@@ -136,6 +152,8 @@ export async function buildInstanceInputForDefinition(
         id: backendIntent.id,
         config: backendIntent.config,
       },
+      ...(respondTo ? { respondTo } : {}),
+      ...(respondToAllowlist ? { respondToAllowlist } : {}),
     };
   }
 
@@ -157,5 +175,7 @@ export async function buildInstanceInputForDefinition(
     spawnAfterCreate: true,
     startOnAppLaunch: true,
     backend: { type: "local" },
+    ...(respondTo ? { respondTo } : {}),
+    ...(respondToAllowlist ? { respondToAllowlist } : {}),
   };
 }

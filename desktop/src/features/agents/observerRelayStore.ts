@@ -6,7 +6,10 @@ import type { ControlResultFrame } from "@/shared/api/types";
 import { putAgentSessionConfig } from "@/shared/api/tauri";
 import { putManagedAgentRuntimeLifecycle } from "@/shared/api/tauriManagedAgents";
 import { getIdentity } from "@/shared/api/tauriIdentity";
-import { decryptObserverEvent } from "@/shared/api/tauriObserver";
+import {
+  decryptObserverEvent,
+  listBufferedObserverEvents,
+} from "@/shared/api/tauriObserver";
 import {
   parseAgentManagementRequest,
   type AgentManagementRequest,
@@ -435,23 +438,24 @@ export function ensureRelayObserverSubscription() {
   setConnectionState("connecting", null);
   startPromise = (async () => {
     const identity = await getIdentity();
+    const enqueueRelayEvent = (event: RelayEvent) => {
+      eventProcessingQueue = eventProcessingQueue
+        .then(() => handleRelayObserverEvent(event, activeGeneration))
+        .catch((error) => {
+          if (activeGeneration !== generation) {
+            return;
+          }
+          setConnectionState(
+            "error",
+            error instanceof Error
+              ? `Observer event handling failed: ${error.message}`
+              : "Observer event handling failed.",
+          );
+        });
+    };
     const unsubscribe = await subscribeToAgentObserverFrames(
       identity.pubkey,
-      (event) => {
-        eventProcessingQueue = eventProcessingQueue
-          .then(() => handleRelayObserverEvent(event, activeGeneration))
-          .catch((error) => {
-            if (activeGeneration !== generation) {
-              return;
-            }
-            setConnectionState(
-              "error",
-              error instanceof Error
-                ? `Observer event handling failed: ${error.message}`
-                : "Observer event handling failed.",
-            );
-          });
-      },
+      enqueueRelayEvent,
     );
     if (activeGeneration !== generation) {
       await unsubscribe();
@@ -459,6 +463,27 @@ export function ensureRelayObserverSubscription() {
     }
     unsubscribeRelay = unsubscribe;
     setConnectionState("open", null);
+
+    // Hydrate from host ring buffer (web). Desktop returns [] — no-op.
+    // Covers the common path: open Activity after a turn already started;
+    // pure-ephemeral 24200 frames are gone from the relay by then.
+    try {
+      const buffered = await listBufferedObserverEvents({
+        since: Math.floor(Date.now() / 1_000) - 30 * 60,
+        limit: 500,
+      });
+      if (activeGeneration !== generation) {
+        return;
+      }
+      for (const event of buffered) {
+        enqueueRelayEvent(event);
+      }
+    } catch (error) {
+      console.debug(
+        "Observer buffer hydrate skipped:",
+        error instanceof Error ? error.message : error,
+      );
+    }
   })()
     .catch((error) => {
       if (activeGeneration === generation) {

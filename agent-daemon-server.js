@@ -35,6 +35,90 @@ const {
   verifyEvent,
 } = requireDesktop("nostr-tools");
 
+// NIP-OA Schnorr (BIP-340) via @noble/curves (pulled in by nostr-tools).
+// Managed-agent kind:0 must carry owner attestation; without it the relay
+// rejects kind:24200 observer frames ("not authorized for this agent owner").
+let nobleSchnorr = null;
+function getNobleSchnorr() {
+  if (nobleSchnorr) return nobleSchnorr;
+  const candidates = [];
+  // Resolve from desktop's dependency tree (pnpm nests @noble under .pnpm).
+  try {
+    const ntEntry = requireDesktop.resolve("nostr-tools");
+    const fromNt = createRequire(ntEntry);
+    candidates.push(fromNt.resolve("@noble/curves/secp256k1"));
+  } catch {
+    /* ignore */
+  }
+  try {
+    candidates.push(requireDesktop.resolve("@noble/curves/secp256k1"));
+  } catch {
+    /* ignore */
+  }
+  // Fallback: scan known pnpm layouts under the monorepo root.
+  try {
+    const pnpmDir = path.join(__dirname, "node_modules", ".pnpm");
+    if (fs.existsSync(pnpmDir)) {
+      for (const name of fs.readdirSync(pnpmDir)) {
+        if (!name.startsWith("@noble+curves@")) continue;
+        const candidate = path.join(
+          pnpmDir,
+          name,
+          "node_modules",
+          "@noble",
+          "curves",
+          "secp256k1.js",
+        );
+        if (fs.existsSync(candidate)) candidates.push(candidate);
+      }
+    }
+  } catch {
+    /* ignore */
+  }
+  const errors = [];
+  for (const p of candidates) {
+    try {
+      // eslint-disable-next-line import/no-dynamic-require
+      const mod = require(p);
+      if (mod?.schnorr?.sign) {
+        nobleSchnorr = mod.schnorr;
+        return nobleSchnorr;
+      }
+      errors.push(`${p}: no schnorr.sign`);
+    } catch (err) {
+      errors.push(`${p}: ${err instanceof Error ? err.message : err}`);
+    }
+  }
+  throw new Error(
+    `NIP-OA: @noble/curves schnorr unavailable — ${errors.join(" | ") || "no candidates"}`,
+  );
+}
+
+/**
+ * Compute NIP-OA auth tag JSON:
+ *   ["auth","<owner_pubkey_hex>","<conditions>","<sig_hex>"]
+ * preimage = "nostr:agent-auth:" || agent_pubkey_hex || ":" || conditions
+ * message  = SHA256(preimage); sig = BIP-340 Schnorr(message, owner_seckey)
+ */
+function computeNipOaAuthTag(ownerSeckeyHex, agentPubkeyHex, conditions = "") {
+  const ownerSk = hexToBytes(ownerSeckeyHex);
+  const agentPk = String(agentPubkeyHex).toLowerCase();
+  if (!HEX64.test(agentPk)) throw new Error("invalid agent pubkey for NIP-OA");
+  if (conditions && /[\s]/.test(conditions)) {
+    throw new Error("NIP-OA conditions must not contain whitespace");
+  }
+  const schnorr = getNobleSchnorr();
+  const ownerPk = bytesToHex(schnorr.getPublicKey(ownerSk)).toLowerCase();
+  if (ownerPk === agentPk) {
+    throw new Error("NIP-OA self-attestation rejected");
+  }
+  const preimage = `nostr:agent-auth:${agentPk}:${conditions}`;
+  const message = crypto.createHash("sha256").update(preimage).digest();
+  const sig = schnorr.sign(message, ownerSk);
+  const sigHex = bytesToHex(sig).toLowerCase();
+  return JSON.stringify(["auth", ownerPk, conditions, sigHex]);
+}
+
 /** Mirror desktop TIMELINE_KINDS minus huddle (voice out of scope). */
 const TIMELINE_KINDS = [9, 40002, 40008, 40099, 43001, 43002, 43003, 43004, 43005, 43006];
 
@@ -632,6 +716,62 @@ async function ipcGetChannelWindow(args) {
   return await queryRelay([filter]);
 }
 
+/**
+ * Server-side thread subtree under a root (desktop get_thread_replies parity).
+ *
+ * The relay routes a filter with a single `#e` + `depth_limit` to
+ * get_thread_replies. `kinds` must be TIMELINE_KINDS so the p-gate does not
+ * demand a `#p` tag. Returns replies only (not the root), oldest-first.
+ */
+async function ipcGetThreadReplies(args) {
+  const rootEventId = String(
+    args.rootEventId || args.root_event_id || args.eventId || args.event_id || "",
+  ).trim();
+  if (!rootEventId || !/^[0-9a-f]{64}$/i.test(rootEventId)) {
+    throw new Error("rootEventId required (64-char hex)");
+  }
+  const channelId =
+    args.channelId || args.channel_id || args.channelID || null;
+  const cap = Math.min(
+    Number(args.limit ?? 200) || 200,
+    500,
+  );
+  const depthLimit = Math.min(
+    Number(args.depthLimit ?? args.depth_limit ?? 64) || 64,
+    256,
+  );
+  const cursor = args.cursor || null;
+  const filter = {
+    "#e": [rootEventId],
+    kinds: TIMELINE_KINDS,
+    depth_limit: depthLimit,
+    limit: cap,
+  };
+  if (channelId) {
+    filter["#h"] = [String(channelId)];
+  }
+  if (cursor) {
+    const createdAt = cursor.created_at ?? cursor.createdAt;
+    const eventId = cursor.event_id ?? cursor.eventId;
+    if (createdAt != null) filter.thread_cursor = createdAt;
+    if (eventId) filter.thread_cursor_id = eventId;
+  }
+  const events = await queryRelay([filter]);
+  // Chronological (oldest first) — desktop useThreadReplies expects this.
+  events.sort((a, b) => {
+    const ta = a.created_at || 0;
+    const tb = b.created_at || 0;
+    if (ta !== tb) return ta - tb;
+    return String(a.id || "").localeCompare(String(b.id || ""));
+  });
+  let next_cursor = null;
+  if (events.length >= cap && events.length > 0) {
+    const last = events[events.length - 1];
+    next_cursor = { created_at: last.created_at, event_id: last.id };
+  }
+  return { events, next_cursor };
+}
+
 async function ipcSendChannelMessage(args) {
   const channelId = args.channelId || args.channel_id;
   const content = (args.content || "").trim();
@@ -1139,8 +1279,24 @@ function profileFromKind0(ev) {
   if (typeof avatar === "string" && avatar.startsWith("data:")) {
     avatar = null;
   }
-  const owner =
+  // Prefer NIP-OA auth tag owner (relay's is_agent_owner source of truth)
+  // over content-embedded fields.
+  let owner =
     content.owner_pubkey || content.ownerPubkey || content.owner || null;
+  if (Array.isArray(ev.tags)) {
+    for (const t of ev.tags) {
+      if (
+        t &&
+        t[0] === "auth" &&
+        t.length >= 4 &&
+        typeof t[1] === "string" &&
+        /^[0-9a-f]{64}$/i.test(t[1])
+      ) {
+        owner = String(t[1]).toLowerCase();
+        break;
+      }
+    }
+  }
   return {
     pubkey: ev.pubkey,
     display_name: content.display_name || content.name || null,
@@ -1596,6 +1752,64 @@ function ipcListManagedAgents() {
   return list;
 }
 
+/**
+ * Resolve mint-time respond-to gate (desktop resolve_mint_behavioral_defaults).
+ * Explicit create input wins; else linked persona; else owner-only.
+ */
+function resolveMintRespondTo(input, personaId, ownerPk) {
+  const VALID = new Set(["owner-only", "allowlist", "anyone", "nobody"]);
+  const explicitMode = input.respondTo || input.respond_to || null;
+  const explicitListRaw = input.respondToAllowlist ?? input.respond_to_allowlist;
+  const hasExplicitList = Array.isArray(explicitListRaw);
+
+  let mode = null;
+  let list = [];
+
+  if (explicitMode && VALID.has(String(explicitMode))) {
+    mode = String(explicitMode);
+    list = hasExplicitList ? explicitListRaw.slice() : [];
+  } else if (personaId) {
+    const personas = loadPersonas();
+    const persona = personas.find((p) => p.id === personaId);
+    if (persona && persona.respond_to && VALID.has(String(persona.respond_to))) {
+      mode = String(persona.respond_to);
+      list = Array.isArray(persona.respond_to_allowlist)
+        ? persona.respond_to_allowlist.slice()
+        : [];
+    }
+  }
+
+  if (!mode) {
+    mode = "owner-only";
+    list = hasExplicitList
+      ? explicitListRaw.slice()
+      : ownerPk
+        ? [ownerPk]
+        : [];
+  }
+
+  if (mode === "allowlist" && list.length === 0) {
+    // Soft-fail to owner-only rather than refusing create when persona
+    // allowlist was empty (desktop fails hard; web host prefers a usable agent).
+    if (ownerPk) {
+      mode = "owner-only";
+      list = [ownerPk];
+    } else {
+      throw new Error(
+        "respond-to mode 'allowlist' requires at least one pubkey in the allowlist",
+      );
+    }
+  }
+  if (mode === "anyone" || mode === "nobody") {
+    list = [];
+  }
+  if (mode === "owner-only" && list.length === 0 && ownerPk) {
+    list = [ownerPk];
+  }
+
+  return { respond_to: mode, respond_to_allowlist: list };
+}
+
 function ipcCreateManagedAgent(args) {
   const input = args.input || args;
   const name = String(input.name || "").trim();
@@ -1658,11 +1872,18 @@ function ipcCreateManagedAgent(args) {
     }
   }
 
+  const personaId = input.personaId || input.persona_id || null;
+  // Mint-time behavioral defaults: explicit create input wins, else linked
+  // persona (NIP-AP definition), else owner-only. Without the persona fallback
+  // a definition set to "anyone" still spawned as owner-only forever — stop/
+  // start only re-reads the frozen record, so the gate never opened.
+  const mintedGate = resolveMintRespondTo(input, personaId, ownerPk);
+
   const record = {
     pubkey,
     seckey_hex: seckeyHex,
     name,
-    persona_id: input.personaId || input.persona_id || null,
+    persona_id: personaId,
     runtime: input.runtime || globalCfg.preferred_runtime || null,
     team_id: input.teamId || input.team_id || null,
     relay_url: (input.relayUrl || input.relay_url || RELAY_WS).replace(/\/+$/, ""),
@@ -1713,14 +1934,8 @@ function ipcCreateManagedAgent(args) {
     auto_restart_on_config_change: true,
     backend: input.backend || { type: "local" },
     backend_agent_id: null,
-    respond_to: input.respondTo || input.respond_to || "owner-only",
-    respond_to_allowlist: Array.isArray(
-      input.respondToAllowlist || input.respond_to_allowlist,
-    )
-      ? input.respondToAllowlist || input.respond_to_allowlist
-      : ownerPk
-        ? [ownerPk]
-        : [],
+    respond_to: mintedGate.respond_to,
+    respond_to_allowlist: mintedGate.respond_to_allowlist,
   };
 
   const store = loadManagedAgentsStore();
@@ -1810,9 +2025,59 @@ function ipcUpdateManagedAgent(args) {
   if (input.harnessOverride && input.agentCommand) {
     next.agent_command = input.agentCommand;
   }
+  // Switching to anyone/owner-only: clear a stale allowlist only when the
+  // caller explicitly changed mode without supplying a new list. Preserve
+  // the list across toggles when only mode is flipped and list is omitted —
+  // except for anyone, where a leftover list confuses the UI.
+  if (
+    (input.respondTo === "anyone" || input.respond_to === "anyone") &&
+    input.respondToAllowlist === undefined &&
+    input.respond_to_allowlist === undefined
+  ) {
+    next.respond_to_allowlist = [];
+  }
+  if (
+    next.respond_to === "allowlist" &&
+    (!Array.isArray(next.respond_to_allowlist) ||
+      next.respond_to_allowlist.length === 0)
+  ) {
+    throw new Error(
+      "respond-to mode 'allowlist' requires at least one pubkey in the allowlist",
+    );
+  }
+  const gateChanged =
+    next.respond_to !== existing.respond_to ||
+    JSON.stringify(next.respond_to_allowlist || []) !==
+      JSON.stringify(existing.respond_to_allowlist || []);
   store.agents[idx] = next;
   saveManagedAgentsStore(store);
-  return { agent: managedAgentSummary(next) };
+
+  // respond-to is a process launch flag (--respond-to / BUZZ_ACP_RESPOND_TO).
+  // Desktop update_managed_agent also does not hot-reload it; without a
+  // restart the running process keeps the mint-time gate forever.
+  if (gateChanged) {
+    const wasRunning =
+      runningAgentProcesses.has(pubkey) ||
+      (next.pid && isPidAlive(next.pid) && next.status === "running");
+    if (wasRunning) {
+      try {
+        stopManagedAgentProcess(pubkey);
+        ipcStartManagedAgent({ pubkey });
+      } catch (err) {
+        console.warn(
+          `[update_managed_agent] restart after respond-to change failed for ${next.name}:`,
+          err instanceof Error ? err.message : err,
+        );
+      }
+    }
+  }
+
+  const afterStore = loadManagedAgentsStore();
+  const after =
+    afterStore.agents.find(
+      (a) => String(a.pubkey).toLowerCase() === pubkey,
+    ) || next;
+  return { agent: managedAgentSummary(after) };
 }
 
 function ipcDeleteManagedAgent(args) {
@@ -1953,6 +2218,10 @@ function stopManagedAgentProcess(pubkey) {
 /**
  * Publish kind:0 profile for an arbitrary seckey (host human or agent).
  * AUTH must use the same key that signed the event.
+ *
+ * For agents, pass `authTag` as either a JSON string
+ * `["auth",owner,conditions,sig]` or a 4-element tag array so the relay can
+ * map agent → owner (required for kind:24200 observer frames).
  */
 async function publishKind0Profile(seckeyHex, profile) {
   const sk = hexToBytes(seckeyHex);
@@ -1970,11 +2239,30 @@ async function publishKind0Profile(seckeyHex, profile) {
     content.nip05 = profile.nip05 || profile.nip05_handle;
   }
   if (profile.bot === true) content.bot = true;
+
+  const tags = [];
+  let authTag = profile.authTag || profile.auth_tag || null;
+  if (typeof authTag === "string" && authTag.trim().startsWith("[")) {
+    try {
+      authTag = JSON.parse(authTag);
+    } catch {
+      authTag = null;
+    }
+  }
+  if (Array.isArray(authTag) && authTag[0] === "auth" && authTag.length >= 4) {
+    tags.push([
+      "auth",
+      String(authTag[1]).toLowerCase(),
+      String(authTag[2] ?? ""),
+      String(authTag[3]).toLowerCase(),
+    ]);
+  }
+
   const event = finalizeEvent(
     {
       kind: 0,
       created_at: Math.floor(Date.now() / 1000),
-      tags: [],
+      tags,
       content: JSON.stringify(content),
     },
     sk,
@@ -2018,19 +2306,60 @@ async function ensureHostProfilePublished() {
   };
 }
 
+/**
+ * True when kind:0 already carries a structurally valid NIP-OA auth tag
+ * whose owner matches the current host identity (observer owner).
+ */
+function kind0HasHostOwnerAuth(kind0Event, hostPubkeyHex) {
+  if (!kind0Event || !Array.isArray(kind0Event.tags)) return false;
+  const me = String(hostPubkeyHex || "").toLowerCase();
+  for (const t of kind0Event.tags) {
+    if (
+      t &&
+      t[0] === "auth" &&
+      t.length >= 4 &&
+      typeof t[1] === "string" &&
+      HEX64.test(t[1]) &&
+      typeof t[3] === "string" &&
+      t[3].length === 128 &&
+      /^[0-9a-f]+$/i.test(t[3]) &&
+      String(t[1]).toLowerCase() === me
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 async function ensureAgentProfilePublished(record) {
   if (!record.seckey_hex) return null;
+  const agentPk = String(record.pubkey).toLowerCase();
+  const hostPk = hostPubkey().toLowerCase();
   const events = await queryRelay([
-    { kinds: [0], authors: [record.pubkey], limit: 1 },
+    { kinds: [0], authors: [agentPk], limit: 1 },
   ]);
-  if (events[0]) {
+  if (events[0] && kind0HasHostOwnerAuth(events[0], hostPk)) {
     try {
       const content = JSON.parse(events[0].content || "{}");
       if (content.display_name || content.name) return events[0];
     } catch {
-      /* republish */
+      /* republish with auth */
     }
   }
+
+  // Always re-publish when missing host NIP-OA auth: relay gates 24200 on
+  // is_agent_owner, which is established from the agent's kind:0 auth tag.
+  let authTagArr = null;
+  try {
+    const tagJson = computeNipOaAuthTag(loadSecretKeyHex(), agentPk, "");
+    authTagArr = JSON.parse(tagJson);
+  } catch (err) {
+    console.warn(
+      `[ensureAgentProfilePublished] NIP-OA auth tag failed for ${record.name}:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+
   return publishKind0Profile(record.seckey_hex, {
     display_name: record.name,
     name: record.name,
@@ -2039,6 +2368,7 @@ async function ensureAgentProfilePublished(record) {
       : `Buzz managed agent (${record.persona_id || "custom"})`,
     bot: true,
     avatar_url: record.avatar_url,
+    authTag: authTagArr,
   });
 }
 
@@ -2130,6 +2460,20 @@ function ipcStartManagedAgent(args) {
     .filter(Boolean)
     .join(",");
 
+  // NIP-OA: buzz-acp must put this tag on AUTH so the relay materializes
+  // users.agent_owner_pubkey. Without that, kind:24200 frames are rejected
+  // ("observer frame is not authorized for this agent owner") and Activity
+  // only shows the typing "just now" fallback with an empty transcript.
+  let buzzAuthTag = null;
+  try {
+    buzzAuthTag = computeNipOaAuthTag(loadSecretKeyHex(), pubkey, "");
+  } catch (err) {
+    console.warn(
+      `[start_managed_agent] NIP-OA BUZZ_AUTH_TAG failed for ${record.name}:`,
+      err instanceof Error ? err.message : err,
+    );
+  }
+
   const childEnv = {
     ...process.env,
     PATH: hostSearchPath(),
@@ -2146,6 +2490,8 @@ function ipcStartManagedAgent(args) {
     // Desktop always enables relay observer (kind 24200 telemetry). Without this
     // the agent replies in-channel but Activity panel stays empty forever.
     BUZZ_ACP_RELAY_OBSERVER: "true",
+    // Required for relay is_agent_owner / Activity observer frames.
+    ...(buzzAuthTag ? { BUZZ_AUTH_TAG: buzzAuthTag } : {}),
     OPENAI_BASE_URL: envFile.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL,
     OPENAI_API_KEY: envFile.OPENAI_API_KEY || process.env.OPENAI_API_KEY,
     BUZZ_ACP_MODEL: model,
@@ -4743,6 +5089,13 @@ async function handleIpc(cmd, args = {}) {
     case "get_channel_window":
       return await ipcGetChannelWindow(args);
 
+    // Desktop thread panel: server-side subtree under a root (see
+    // desktop get_thread_replies). Without this the web host returns
+    // "unknown cmd" and the open-thread UI stays empty even when replies
+    // exist in the channel timeline.
+    case "get_thread_replies":
+      return await ipcGetThreadReplies(args);
+
     case "get_event": {
       const eventId = args.eventId || args.event_id || args.id;
       if (!eventId) throw new Error("eventId required");
@@ -4750,6 +5103,7 @@ async function handleIpc(cmd, args = {}) {
         { ids: [eventId], limit: 1 },
       ]);
       if (!events[0]) throw new Error("event not found");
+      // Desktop tauri returns a JSON *string*; getEventById JSON.parses it.
       return JSON.stringify(events[0]);
     }
 
@@ -4807,6 +5161,11 @@ async function handleIpc(cmd, args = {}) {
       return ipcDecryptObserverEvent(args);
     case "build_observer_control_event":
       return ipcBuildObserverControlEvent(args);
+    // Web has no SQLite observer archive; kind:24200 is ephemeral. Host keeps
+    // a short ring buffer so Activity can hydrate after the user opens the
+    // panel mid-turn (desktop archive would cover this).
+    case "list_buffered_observer_events":
+      return ipcListBufferedObserverEvents(args);
 
     // ── Home / search / canvas / presence ──
     case "get_feed":
@@ -5111,4 +5470,180 @@ server.listen(PORT, "0.0.0.0", () => {
   } catch (err) {
     console.log(`Buzz host IPC :${PORT} (key error: ${err.message})`);
   }
+  // Start host-side observer ring buffer (best-effort; Activity hydration).
+  try {
+    ensureObserverFrameBuffer();
+  } catch (err) {
+    console.warn(
+      "[observer-buffer] start failed:",
+      err instanceof Error ? err.message : err,
+    );
+  }
 });
+
+// ── Kind:24200 observer ring buffer (web Activity hydration) ────────────────
+// Desktop persists 24200 via local archive subscriptions. Web has no SQLite
+// archive, and the relay treats 24200 as pure-ephemeral (REQ lookback is empty).
+// Without a host-side buffer, opening Activity after a turn already started
+// shows only the typing "just now" signal with an empty transcript.
+const OBSERVER_BUFFER_MAX = 2000;
+const OBSERVER_BUFFER_MAX_AGE_SECS = 30 * 60;
+/** @type {Map<string, object>} id → raw nostr event */
+const observerFrameBuffer = new Map();
+let observerBufferWs = null;
+let observerBufferGeneration = 0;
+let observerBufferReconnectTimer = null;
+
+function pushObserverFrame(event) {
+  if (!event || !event.id || event.kind !== 24200) return;
+  if (observerFrameBuffer.has(event.id)) return;
+  observerFrameBuffer.set(event.id, event);
+  while (observerFrameBuffer.size > OBSERVER_BUFFER_MAX) {
+    const first = observerFrameBuffer.keys().next().value;
+    observerFrameBuffer.delete(first);
+  }
+  // Drop stale by created_at (Map is insertion-ordered; prune fully on burst).
+  const cutoff = Math.floor(Date.now() / 1000) - OBSERVER_BUFFER_MAX_AGE_SECS;
+  for (const [id, ev] of observerFrameBuffer) {
+    if ((ev.created_at || 0) < cutoff) observerFrameBuffer.delete(id);
+  }
+}
+
+function ipcListBufferedObserverEvents(args) {
+  const since = Number(args.since ?? 0) || 0;
+  const agentPubkey = String(args.agentPubkey || args.agent_pubkey || "")
+    .trim()
+    .toLowerCase();
+  const channelId = args.channelId || args.channel_id || null;
+  const limit = Math.min(Number(args.limit ?? 500) || 500, 1000);
+  const out = [];
+  for (const ev of observerFrameBuffer.values()) {
+    if (since && (ev.created_at || 0) < since) continue;
+    if (agentPubkey) {
+      const agentTag = Array.isArray(ev.tags)
+        ? ev.tags.find((t) => t && t[0] === "agent")
+        : null;
+      const tagPk = agentTag && agentTag[1] ? String(agentTag[1]).toLowerCase() : "";
+      if (tagPk !== agentPubkey && String(ev.pubkey || "").toLowerCase() !== agentPubkey) {
+        continue;
+      }
+    }
+    out.push(ev);
+    if (out.length >= limit) break;
+  }
+  // channel filter is best-effort after decrypt on the client; raw events
+  // do not carry channelId in tags.
+  void channelId;
+  return { events: out, buffered: observerFrameBuffer.size };
+}
+
+function ensureObserverFrameBuffer() {
+  if (observerBufferWs && observerBufferWs.readyState <= 1) return;
+  if (typeof WebSocket === "undefined") {
+    console.warn("[observer-buffer] global WebSocket unavailable");
+    return;
+  }
+  const gen = ++observerBufferGeneration;
+  const hostPk = hostPubkey().toLowerCase();
+  const url = RELAY_WS;
+  let ws;
+  try {
+    ws = new WebSocket(url);
+  } catch (err) {
+    console.warn("[observer-buffer] connect failed:", err.message);
+    scheduleObserverBufferReconnect();
+    return;
+  }
+  observerBufferWs = ws;
+  let authed = false;
+  ws.addEventListener("open", () => {
+    /* wait for AUTH challenge */
+  });
+  ws.addEventListener("message", async (ev) => {
+    if (gen !== observerBufferGeneration) return;
+    let msg;
+    try {
+      msg = JSON.parse(typeof ev.data === "string" ? ev.data : String(ev.data));
+    } catch {
+      return;
+    }
+    if (!Array.isArray(msg) || !msg.length) return;
+    if (msg[0] === "AUTH" && typeof msg[1] === "string") {
+      try {
+        const authJson = await ipcCreateAuthEvent({
+          challenge: msg[1],
+          relayUrl: url,
+        });
+        const authEv =
+          typeof authJson === "string" ? JSON.parse(authJson) : authJson;
+        ws.send(JSON.stringify(["AUTH", authEv]));
+      } catch (err) {
+        console.warn(
+          "[observer-buffer] AUTH failed:",
+          err instanceof Error ? err.message : err,
+        );
+      }
+      return;
+    }
+    if (msg[0] === "OK" && !authed) {
+      authed = true;
+      const since = Math.floor(Date.now() / 1000) - OBSERVER_BUFFER_MAX_AGE_SECS;
+      ws.send(
+        JSON.stringify([
+          "REQ",
+          "host-obs-buf",
+          {
+            kinds: [24200],
+            "#p": [hostPk],
+            limit: 1000,
+            since,
+          },
+        ]),
+      );
+      console.log("[observer-buffer] subscribed #p=", hostPk.slice(0, 12));
+      return;
+    }
+    if (msg[0] === "EVENT" && msg[1] === "host-obs-buf" && msg[2]) {
+      pushObserverFrame(msg[2]);
+      return;
+    }
+    if (msg[0] === "NOTICE") {
+      // ignore
+    }
+  });
+  ws.addEventListener("close", () => {
+    if (gen !== observerBufferGeneration) return;
+    observerBufferWs = null;
+    scheduleObserverBufferReconnect();
+  });
+  ws.addEventListener("error", () => {
+    try {
+      ws.close();
+    } catch {
+      /* ignore */
+    }
+  });
+}
+
+function scheduleObserverBufferReconnect() {
+  if (observerBufferReconnectTimer) return;
+  observerBufferReconnectTimer = setTimeout(() => {
+    observerBufferReconnectTimer = null;
+    try {
+      ensureObserverFrameBuffer();
+    } catch (err) {
+      console.warn(
+        "[observer-buffer] reconnect failed:",
+        err instanceof Error ? err.message : err,
+      );
+      scheduleObserverBufferReconnect();
+    }
+  }, 3000);
+}
+
+function ipcCreateAuthEvent(args) {
+  const challenge = args.challenge;
+  const relayUrl = args.relayUrl || args.relay_url || RELAY_WS;
+  if (!challenge) throw new Error("challenge required");
+  return JSON.stringify(createAuthEvent(challenge, relayUrl));
+}
