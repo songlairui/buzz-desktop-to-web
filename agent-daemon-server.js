@@ -26,13 +26,80 @@ const RELAY_WS = process.env.BUZZ_RELAY_URL || "wss://buzz.f.mtt.cool";
 const requireDesktop = createRequire(
   path.join(__dirname, "desktop", "package.json"),
 );
-const { finalizeEvent, getPublicKey, nip19 } = requireDesktop("nostr-tools");
+const {
+  finalizeEvent,
+  getPublicKey,
+  nip19,
+  nip44,
+  generateSecretKey,
+} = requireDesktop("nostr-tools");
 
 /** Mirror desktop TIMELINE_KINDS minus huddle (voice out of scope). */
 const TIMELINE_KINDS = [9, 40002, 40008, 40099, 43001, 43002, 43003, 43004, 43005, 43006];
 
 /** Channels we just created: membership (kind:39002) may lag; treat as member. */
 const pendingOwnedChannelIds = new Set();
+
+/** Web-host local agent store (personas + managed agents). */
+const WEB_CONFIG_DIR =
+  process.env.BUZZ_WEB_CONFIG_DIR ||
+  path.join(process.env.HOME || "/home/lary", ".config/buzz-web");
+const PERSONAS_JSON_PATH =
+  process.env.BUZZ_WEB_PERSONAS_FILE ||
+  path.join(WEB_CONFIG_DIR, "personas.json");
+const MANAGED_AGENTS_JSON_PATH =
+  process.env.BUZZ_WEB_MANAGED_AGENTS_FILE ||
+  path.join(WEB_CONFIG_DIR, "managed-agents.json");
+
+const FIZZ_SYSTEM_PROMPT =
+  "You are Fizz, an energetic maker who turns ideas into action. Be upbeat, practical, and decisive. Help users plan, create, solve problems, and finish work. Add occasional bee wordplay or 🐝✨—keep it charming, never distracting.";
+const HONEY_SYSTEM_PROMPT =
+  "You are Honey, a warm and thoughtful communicator. Help users write clearly, organize ideas, brainstorm, summarize, and prepare for conversations. Be kind, creative, and concise. Add occasional bee wordplay or 🍯🐝—keep it sweet, never excessive.";
+const BUMBLE_SYSTEM_PROMPT =
+  "You are Bumble, a curious and adventurous researcher. Explore questions, compare options, check assumptions, and explain what you find clearly. Be candid when uncertain and favor useful evidence. Add occasional bee wordplay or 🐝🔎—keep it playful, never chaotic.";
+
+const BUILT_IN_PERSONAS = [
+  {
+    id: "builtin:fizz",
+    display_name: "Fizz",
+    system_prompt: FIZZ_SYSTEM_PROMPT,
+    name_pool: [
+      "Nectar",
+      "Comet",
+      "Bramble",
+      "Clover",
+      "Pollen",
+      "Amber",
+      "Daisy",
+      "Mason",
+      "Thistle",
+      "Waxwing",
+      "Hive",
+      "Meadow",
+      "Juniper",
+      "Aster",
+      "Sage",
+      "Willow",
+      "Orchard",
+      "Buzz",
+    ],
+    default_active: true,
+  },
+  {
+    id: "builtin:honey",
+    display_name: "Honey",
+    system_prompt: HONEY_SYSTEM_PROMPT,
+    name_pool: ["Honey"],
+    default_active: true,
+  },
+  {
+    id: "builtin:bumble",
+    display_name: "Bumble",
+    system_prompt: BUMBLE_SYSTEM_PROMPT,
+    name_pool: ["Bumble"],
+    default_active: true,
+  },
+];
 
 const FALLBACK_MODELS = [
   { id: "grok-4.5", name: "grok-4.5", description: "xAI Grok 4.5" },
@@ -1187,68 +1254,481 @@ function getAgentPubkey() {
   return getPublicKey(hexToBytes(skHex.trim()));
 }
 
+// ── Personas + managed agents (file-backed web host) ────────────────────────
+
+function isoNow() {
+  return new Date().toISOString();
+}
+
+function readJsonFile(filePath, fallback) {
+  try {
+    if (!fs.existsSync(filePath)) return fallback;
+    const raw = JSON.parse(fs.readFileSync(filePath, "utf8"));
+    return raw ?? fallback;
+  } catch (err) {
+    console.warn("readJsonFile failed:", filePath, err.message);
+    return fallback;
+  }
+}
+
+function writeJsonFile(filePath, value) {
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(filePath, JSON.stringify(value, null, 2) + "\n", {
+    mode: 0o600,
+  });
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch {
+    /* ignore */
+  }
+}
+
+function builtInPersonaRecord(def, now) {
+  return {
+    id: def.id,
+    display_name: def.display_name,
+    avatar_url: null,
+    system_prompt: def.system_prompt,
+    runtime: "pi-coding-agent",
+    model: null,
+    provider: null,
+    name_pool: def.name_pool.slice(),
+    is_builtin: true,
+    is_active: def.default_active !== false,
+    shared: false,
+    source_team: null,
+    catalog_source: null,
+    env_vars: {},
+    respond_to: null,
+    respond_to_allowlist: [],
+    parallelism: null,
+    created_at: now,
+    updated_at: now,
+  };
+}
+
+function loadPersonas() {
+  const now = isoNow();
+  const stored = readJsonFile(PERSONAS_JSON_PATH, []);
+  const list = Array.isArray(stored) ? stored.slice() : [];
+  let changed = false;
+  for (const def of BUILT_IN_PERSONAS) {
+    const existing = list.find((p) => p && p.id === def.id);
+    if (!existing) {
+      list.push(builtInPersonaRecord(def, now));
+      changed = true;
+    } else if (!existing.is_builtin) {
+      existing.is_builtin = true;
+      changed = true;
+    }
+  }
+  if (changed) writeJsonFile(PERSONAS_JSON_PATH, list);
+  return list;
+}
+
+function savePersonas(list) {
+  writeJsonFile(PERSONAS_JSON_PATH, list);
+}
+
+function ipcListPersonas() {
+  return loadPersonas();
+}
+
+function ipcCreatePersona(args) {
+  const input = args.input || args;
+  const displayName = String(input.displayName || input.display_name || "").trim();
+  if (!displayName) throw new Error("displayName is required");
+  const now = isoNow();
+  const id =
+    String(input.id || "").trim() ||
+    `persona:${crypto.randomUUID()}`;
+  const personas = loadPersonas();
+  if (personas.some((p) => p.id === id)) {
+    throw new Error(`persona already exists: ${id}`);
+  }
+  const record = {
+    id,
+    display_name: displayName,
+    avatar_url: input.avatarUrl ?? input.avatar_url ?? null,
+    system_prompt: String(input.systemPrompt ?? input.system_prompt ?? ""),
+    runtime: input.runtime ?? "pi-coding-agent",
+    model: input.model ?? null,
+    provider: input.provider ?? null,
+    name_pool: Array.isArray(input.namePool || input.name_pool)
+      ? input.namePool || input.name_pool
+      : [],
+    is_builtin: false,
+    is_active: true,
+    shared: false,
+    source_team: null,
+    catalog_source: input.catalogSource || input.catalog_source || null,
+    env_vars: input.envVars || input.env_vars || {},
+    respond_to:
+      (input.behavior && input.behavior.respondTo) ||
+      input.respond_to ||
+      null,
+    respond_to_allowlist:
+      (input.behavior && input.behavior.respondToAllowlist) ||
+      input.respond_to_allowlist ||
+      [],
+    parallelism:
+      (input.behavior && input.behavior.parallelism) ??
+      input.parallelism ??
+      null,
+    created_at: now,
+    updated_at: now,
+  };
+  personas.push(record);
+  savePersonas(personas);
+  return record;
+}
+
+function ipcUpdatePersona(args) {
+  const input = args.input || args;
+  const id = String(input.id || "").trim();
+  if (!id) throw new Error("id required");
+  const personas = loadPersonas();
+  const idx = personas.findIndex((p) => p.id === id);
+  if (idx < 0) throw new Error(`persona not found: ${id}`);
+  const existing = personas[idx];
+  const next = { ...existing, updated_at: isoNow() };
+  if (input.displayName != null || input.display_name != null) {
+    next.display_name = String(input.displayName ?? input.display_name).trim();
+  }
+  if (input.avatarUrl !== undefined || input.avatar_url !== undefined) {
+    next.avatar_url = input.avatarUrl ?? input.avatar_url ?? null;
+  }
+  if (input.systemPrompt != null || input.system_prompt != null) {
+    next.system_prompt = String(input.systemPrompt ?? input.system_prompt ?? "");
+  }
+  if (input.runtime !== undefined) next.runtime = input.runtime;
+  if (input.model !== undefined) next.model = input.model;
+  if (input.provider !== undefined) next.provider = input.provider;
+  if (input.namePool !== undefined || input.name_pool !== undefined) {
+    next.name_pool = input.namePool ?? input.name_pool ?? [];
+  }
+  if (input.envVars !== undefined || input.env_vars !== undefined) {
+    next.env_vars = input.envVars ?? input.env_vars ?? {};
+  }
+  if (input.behavior) {
+    if (input.behavior.respondTo !== undefined) {
+      next.respond_to = input.behavior.respondTo;
+    }
+    if (input.behavior.respondToAllowlist !== undefined) {
+      next.respond_to_allowlist = input.behavior.respondToAllowlist;
+    }
+    if (input.behavior.parallelism !== undefined) {
+      next.parallelism = input.behavior.parallelism;
+    }
+  }
+  personas[idx] = next;
+  savePersonas(personas);
+  return next;
+}
+
+function ipcSetPersonaActive(args) {
+  const id = String(args.personaId || args.persona_id || args.id || "").trim();
+  const active = args.active ?? args.is_active ?? true;
+  if (!id) throw new Error("personaId required");
+  const personas = loadPersonas();
+  const idx = personas.findIndex((p) => p.id === id);
+  if (idx < 0) throw new Error(`persona not found: ${id}`);
+  personas[idx] = {
+    ...personas[idx],
+    is_active: Boolean(active),
+    updated_at: isoNow(),
+  };
+  savePersonas(personas);
+  return personas[idx];
+}
+
+function loadManagedAgentsStore() {
+  const stored = readJsonFile(MANAGED_AGENTS_JSON_PATH, { agents: [] });
+  if (Array.isArray(stored)) return { agents: stored };
+  if (stored && Array.isArray(stored.agents)) return stored;
+  return { agents: [] };
+}
+
+function saveManagedAgentsStore(store) {
+  writeJsonFile(MANAGED_AGENTS_JSON_PATH, store);
+}
+
+function managedAgentSummary(record) {
+  const env = getEnvConfig();
+  return {
+    pubkey: record.pubkey,
+    name: record.name,
+    persona_id: record.persona_id ?? null,
+    runtime: record.runtime ?? null,
+    team_id: record.team_id ?? null,
+    relay_url: record.relay_url || RELAY_WS,
+    acp_command: record.acp_command || "buzz-acp",
+    agent_command: record.agent_command || env.BUZZ_ACP_AGENT_COMMAND || "pi-coding-agent",
+    agent_command_override: record.agent_command_override ?? null,
+    agent_args: Array.isArray(record.agent_args) ? record.agent_args : ["acp"],
+    mcp_command: record.mcp_command || "",
+    turn_timeout_seconds: record.turn_timeout_seconds ?? 320,
+    idle_timeout_seconds: record.idle_timeout_seconds ?? null,
+    max_turn_duration_seconds: record.max_turn_duration_seconds ?? null,
+    parallelism: record.parallelism ?? 1,
+    system_prompt: record.system_prompt ?? null,
+    avatar_url: record.avatar_url ?? null,
+    model:
+      record.model ?? env.BUZZ_ACP_MODEL ?? env.GOOSE_MODEL ?? "grok-4.5",
+    model_source: record.model_source ?? null,
+    provider: record.provider ?? env.GOOSE_PROVIDER ?? "openai",
+    persona_out_of_date: false,
+    persona_orphaned: false,
+    needs_restart: false,
+    env_vars: record.env_vars || {},
+    status: record.status || "stopped",
+    pid: record.pid ?? null,
+    created_at: record.created_at,
+    updated_at: record.updated_at,
+    last_started_at: record.last_started_at ?? null,
+    last_stopped_at: record.last_stopped_at ?? null,
+    last_exit_code: record.last_exit_code ?? null,
+    last_error: record.last_error ?? null,
+    last_error_code: record.last_error_code ?? null,
+    log_path: record.log_path || `/tmp/buzz-acp-${record.pubkey.slice(0, 12)}.log`,
+    start_on_app_launch: record.start_on_app_launch !== false,
+    auto_restart_on_config_change: record.auto_restart_on_config_change !== false,
+    backend: record.backend || { type: "local" },
+    backend_agent_id: record.backend_agent_id ?? null,
+    respond_to: record.respond_to || "owner-only",
+    respond_to_allowlist: Array.isArray(record.respond_to_allowlist)
+      ? record.respond_to_allowlist
+      : [],
+  };
+}
+
 /**
  * Desktop-style managed agent list for path-3 web.
- * Maps host buzz-acp + systemctl into RawManagedAgent[] (snake_case).
+ * File-backed records + optional legacy host buzz-agent unit.
  */
 function ipcListManagedAgents() {
-  // Fresh onboard: do not invent a managed agent when buzz-agent is stopped/disabled.
-  // Set BUZZ_WEB_SHOW_STOPPED_AGENT=1 to surface the systemd unit as a stopped agent.
+  const store = loadManagedAgentsStore();
+  const list = store.agents.map(managedAgentSummary);
+
+  // Optional: surface the host systemd buzz-agent unit when running.
   const status = getServiceStatus();
-  if (status !== "running" && process.env.BUZZ_WEB_SHOW_STOPPED_AGENT !== "1") {
-    return [];
+  if (status === "running" || process.env.BUZZ_WEB_SHOW_STOPPED_AGENT === "1") {
+    try {
+      const agentPk = getAgentPubkey();
+      if (!list.some((a) => a.pubkey === agentPk)) {
+        const env = getEnvConfig();
+        const ownerPk =
+          process.env.BUZZ_ACP_AGENT_OWNER ||
+          env.BUZZ_ACP_AGENT_OWNER ||
+          hostPubkey();
+        const now = isoNow();
+        const running = status === "running";
+        list.push(
+          managedAgentSummary({
+            pubkey: agentPk,
+            name: "Fedora-Agent",
+            persona_id: null,
+            team_id: null,
+            relay_url: RELAY_WS,
+            acp_command: "buzz-acp",
+            agent_command: env.BUZZ_ACP_AGENT_COMMAND || "pi-coding-agent",
+            agent_args: ["acp"],
+            model: env.BUZZ_ACP_MODEL || env.GOOSE_MODEL || "grok-4.5",
+            provider: env.GOOSE_PROVIDER || "openai",
+            status: running ? "running" : "stopped",
+            pid: running ? 1 : null,
+            created_at: now,
+            updated_at: now,
+            last_started_at: running ? now : null,
+            last_stopped_at: running ? null : now,
+            start_on_app_launch: true,
+            respond_to: env.BUZZ_ACP_RESPOND_TO || "owner-only",
+            respond_to_allowlist: ownerPk ? [ownerPk] : [],
+            seckey_hex: null,
+          }),
+        );
+      }
+    } catch {
+      /* agent key missing */
+    }
   }
+  return list;
+}
+
+function ipcCreateManagedAgent(args) {
+  const input = args.input || args;
+  const name = String(input.name || "").trim();
+  if (!name) throw new Error("agent name is required");
+
+  const skBytes = generateSecretKey();
+  const seckeyHex = bytesToHex(skBytes);
+  const pubkey = getPublicKey(skBytes);
+  const privateKeyNsec = nip19.nsecEncode(skBytes);
+  const now = isoNow();
   const env = getEnvConfig();
-  const agentPk = getAgentPubkey();
-  const ownerPk =
-    process.env.BUZZ_ACP_AGENT_OWNER ||
-    env.BUZZ_ACP_AGENT_OWNER ||
-    hostPubkey();
-  const now = new Date().toISOString();
-  const model = env.BUZZ_ACP_MODEL || env.GOOSE_MODEL || "grok-4.5";
-  const running = status === "running";
-  return [
-    {
-      pubkey: agentPk,
-      name: "Fedora-Agent",
-      persona_id: null,
-      team_id: null,
-      relay_url: RELAY_WS,
-      acp_command: "buzz-acp",
-      agent_command: env.BUZZ_ACP_AGENT_COMMAND || "pi-coding-agent",
-      agent_command_override: null,
-      agent_args: ["acp"],
-      mcp_command: "",
-      turn_timeout_seconds: 320,
-      idle_timeout_seconds: null,
-      max_turn_duration_seconds: null,
-      parallelism: 1,
-      system_prompt: null,
-      avatar_url: null,
-      model,
-      provider: env.GOOSE_PROVIDER || "openai",
-      persona_out_of_date: false,
-      persona_orphaned: false,
-      needs_restart: false,
-      env_vars: {},
-      status: running ? "running" : "stopped",
-      pid: running ? 1 : null,
-      created_at: now,
-      updated_at: now,
-      last_started_at: running ? now : null,
-      last_stopped_at: running ? null : now,
-      last_exit_code: null,
-      last_error: null,
-      last_error_code: null,
-      log_path: `/tmp/buzz-acp-${agentPk.slice(0, 12)}.log`,
-      start_on_app_launch: true,
-      auto_restart_on_config_change: true,
-      backend: { type: "local" },
-      backend_agent_id: null,
-      respond_to: env.BUZZ_ACP_RESPOND_TO || "owner-only",
-      respond_to_allowlist: ownerPk ? [ownerPk] : [],
-    },
+  const ownerPk = hostPubkey();
+
+  const record = {
+    pubkey,
+    seckey_hex: seckeyHex,
+    name,
+    persona_id: input.personaId || input.persona_id || null,
+    runtime: input.runtime || null,
+    team_id: input.teamId || input.team_id || null,
+    relay_url: (input.relayUrl || input.relay_url || RELAY_WS).replace(/\/+$/, ""),
+    acp_command: input.acpCommand || input.acp_command || "buzz-acp",
+    agent_command:
+      input.agentCommand ||
+      input.agent_command ||
+      env.BUZZ_ACP_AGENT_COMMAND ||
+      "pi-coding-agent",
+    agent_command_override: input.agentCommandOverride || null,
+    agent_args: Array.isArray(input.agentArgs || input.agent_args)
+      ? input.agentArgs || input.agent_args
+      : ["acp"],
+    mcp_command: input.mcpCommand || input.mcp_command || "",
+    turn_timeout_seconds:
+      input.turnTimeoutSeconds ?? input.turn_timeout_seconds ?? 320,
+    idle_timeout_seconds:
+      input.idleTimeoutSeconds ?? input.idle_timeout_seconds ?? null,
+    max_turn_duration_seconds:
+      input.maxTurnDurationSeconds ?? input.max_turn_duration_seconds ?? null,
+    parallelism: input.parallelism ?? 1,
+    system_prompt: input.systemPrompt ?? input.system_prompt ?? null,
+    avatar_url: input.avatarUrl ?? input.avatar_url ?? null,
+    model: input.model ?? env.BUZZ_ACP_MODEL ?? env.GOOSE_MODEL ?? "grok-4.5",
+    provider: input.provider ?? env.GOOSE_PROVIDER ?? "openai",
+    env_vars: input.envVars || input.env_vars || {},
+    status: "stopped",
+    pid: null,
+    created_at: now,
+    updated_at: now,
+    last_started_at: null,
+    last_stopped_at: null,
+    last_exit_code: null,
+    last_error: null,
+    last_error_code: null,
+    log_path: `/tmp/buzz-acp-${pubkey.slice(0, 12)}.log`,
+    start_on_app_launch:
+      input.startOnAppLaunch ?? input.start_on_app_launch ?? true,
+    auto_restart_on_config_change: true,
+    backend: input.backend || { type: "local" },
+    backend_agent_id: null,
+    respond_to: input.respondTo || input.respond_to || "owner-only",
+    respond_to_allowlist: Array.isArray(
+      input.respondToAllowlist || input.respond_to_allowlist,
+    )
+      ? input.respondToAllowlist || input.respond_to_allowlist
+      : ownerPk
+        ? [ownerPk]
+        : [],
+  };
+
+  const store = loadManagedAgentsStore();
+  if (store.agents.some((a) => a.pubkey === pubkey)) {
+    throw new Error(`agent ${pubkey} already exists`);
+  }
+  store.agents.push(record);
+  saveManagedAgentsStore(store);
+
+  let spawnError = null;
+  const shouldSpawn =
+    input.spawnAfterCreate !== false && input.spawn_after_create !== false;
+  if (shouldSpawn) {
+    try {
+      // Best-effort: do not block create on process spawn for web MVP.
+      // Full multi-process agent runtime is desktop-only for now.
+      spawnError =
+        "Web host records the agent identity; start the host buzz-agent service to run an ACP process, or use @mentions once an agent is online on the relay.";
+    } catch (err) {
+      spawnError = err instanceof Error ? err.message : String(err);
+    }
+  }
+
+  return {
+    agent: managedAgentSummary(record),
+    private_key_nsec: privateKeyNsec,
+    profile_sync_error: null,
+    spawn_error: spawnError,
+  };
+}
+
+function ipcUpdateManagedAgent(args) {
+  const input = args.input || args;
+  const pubkey = String(input.pubkey || "").trim().toLowerCase();
+  if (!pubkey) throw new Error("pubkey required");
+  const store = loadManagedAgentsStore();
+  const idx = store.agents.findIndex(
+    (a) => String(a.pubkey).toLowerCase() === pubkey,
+  );
+  if (idx < 0) throw new Error(`managed agent not found: ${pubkey}`);
+  const existing = store.agents[idx];
+  const next = { ...existing, updated_at: isoNow() };
+  const map = [
+    ["name", "name"],
+    ["personaId", "persona_id"],
+    ["persona_id", "persona_id"],
+    ["teamId", "team_id"],
+    ["team_id", "team_id"],
+    ["agentCommand", "agent_command"],
+    ["agent_command", "agent_command"],
+    ["agentArgs", "agent_args"],
+    ["agent_args", "agent_args"],
+    ["mcpCommand", "mcp_command"],
+    ["mcp_command", "mcp_command"],
+    ["model", "model"],
+    ["provider", "provider"],
+    ["systemPrompt", "system_prompt"],
+    ["system_prompt", "system_prompt"],
+    ["avatarUrl", "avatar_url"],
+    ["avatar_url", "avatar_url"],
+    ["respondTo", "respond_to"],
+    ["respond_to", "respond_to"],
+    ["respondToAllowlist", "respond_to_allowlist"],
+    ["respond_to_allowlist", "respond_to_allowlist"],
+    ["envVars", "env_vars"],
+    ["env_vars", "env_vars"],
   ];
+  for (const [from, to] of map) {
+    if (input[from] !== undefined) next[to] = input[from];
+  }
+  if (input.harnessOverride && input.agentCommand) {
+    next.agent_command = input.agentCommand;
+  }
+  store.agents[idx] = next;
+  saveManagedAgentsStore(store);
+  return { agent: managedAgentSummary(next) };
+}
+
+function ipcDeleteManagedAgent(args) {
+  const pubkey = String(args.pubkey || "").trim().toLowerCase();
+  if (!pubkey) throw new Error("pubkey required");
+  const store = loadManagedAgentsStore();
+  store.agents = store.agents.filter(
+    (a) => String(a.pubkey).toLowerCase() !== pubkey,
+  );
+  saveManagedAgentsStore(store);
+  return true;
+}
+
+/** NIP-44 encrypt/decrypt to self (read-state snapshots). */
+function ipcNip44EncryptToSelf(args) {
+  const plaintext = args.plaintext ?? args.input?.plaintext;
+  if (typeof plaintext !== "string") throw new Error("plaintext required");
+  const sk = loadSecretKeyBytes();
+  const pk = getPublicKey(sk);
+  const conversationKey = nip44.v2.utils.getConversationKey(sk, pk);
+  return nip44.v2.encrypt(plaintext, conversationKey);
+}
+
+function ipcNip44DecryptFromSelf(args) {
+  const ciphertext = args.ciphertext ?? args.input?.ciphertext;
+  if (typeof ciphertext !== "string") throw new Error("ciphertext required");
+  const sk = loadSecretKeyBytes();
+  const pk = getPublicKey(sk);
+  const conversationKey = nip44.v2.utils.getConversationKey(sk, pk);
+  return nip44.v2.decrypt(ciphertext, conversationKey);
 }
 
 async function ipcListArchivedIdentities() {
@@ -1341,8 +1821,7 @@ function getServiceStatus() {
 async function handleIpc(cmd, args = {}) {
   switch (cmd) {
     case "get_agent_models":
-    case "discover_agent_models":
-    case "discover_backend_providers": {
+    case "discover_agent_models": {
       const models = await fetchFedoraModels();
       const env = getEnvConfig();
       return {
@@ -1354,6 +1833,28 @@ async function handleIpc(cmd, args = {}) {
         supportsSwitching: true,
       };
     }
+
+    // Remote run destinations — NOT models. Empty = local-only create flow.
+    case "discover_backend_providers":
+      return [];
+
+    case "list_personas":
+      return ipcListPersonas();
+
+    case "create_persona":
+      return ipcCreatePersona(args);
+
+    case "update_persona":
+      return ipcUpdatePersona(args);
+
+    case "set_persona_active":
+      return ipcSetPersonaActive(args);
+
+    case "nip44_encrypt_to_self":
+      return ipcNip44EncryptToSelf(args);
+
+    case "nip44_decrypt_from_self":
+      return ipcNip44DecryptFromSelf(args);
 
     case "create_auth_event": {
       const challenge =
@@ -1520,6 +2021,15 @@ async function handleIpc(cmd, args = {}) {
     case "list_managed_agents":
     case "get_managed_agents":
       return ipcListManagedAgents();
+
+    case "create_managed_agent":
+      return ipcCreateManagedAgent(args);
+
+    case "update_managed_agent":
+      return ipcUpdateManagedAgent(args);
+
+    case "delete_managed_agent":
+      return ipcDeleteManagedAgent(args);
 
     case "list_archived_identities":
       return await ipcListArchivedIdentities();

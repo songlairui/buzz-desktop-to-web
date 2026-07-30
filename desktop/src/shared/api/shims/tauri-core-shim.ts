@@ -126,17 +126,23 @@ export async function invoke<T = unknown>(
   switch (cmd) {
     // AgentDefaultsEditor uses discover_agent_models; get_agent_models is the
     // older per-agent path. Both should hit the host daemon model list.
+    //
+    // IMPORTANT: discover_backend_providers is a DIFFERENT command — it must
+    // return BackendProviderCandidate[] (remote run destinations). Mapping it
+    // to the models object made WhereToRunSection call `.find` on a non-array
+    // and crash Create Agent ("i.find is not a function").
+    case "discover_backend_providers":
+      // Web host: no remote backend binaries; local-only create flow.
+      return [] as unknown as T;
+
     case "get_agent_models":
-    case "discover_agent_models":
-    case "discover_backend_providers": {
+    case "discover_agent_models": {
       try {
         const res = await fetch("/api/ipc", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            // Daemon only knows get_agent_models / discover_backend_providers.
-            cmd:
-              cmd === "discover_agent_models" ? "get_agent_models" : cmd,
+            cmd: "get_agent_models",
             args,
           }),
         });
@@ -157,6 +163,10 @@ export async function invoke<T = unknown>(
         supportsSwitching: true
       } as unknown as T;
     }
+
+    case "nip44_encrypt_to_self":
+    case "nip44_decrypt_from_self":
+      return (await hostIpc(cmd, args)) as T;
 
     case "create_auth_event": {
       // Host signs with BUZZ_PRIVATE_KEY — never mock. createAuthEvent() JSON.parses the result.
@@ -478,7 +488,19 @@ export async function invoke<T = unknown>(
 
     case "list_managed_agents":
     case "get_managed_agents":
-      // Host maps buzz-acp into RawManagedAgent[] (snake_case).
+    case "create_managed_agent":
+    case "update_managed_agent":
+    case "delete_managed_agent":
+    case "start_managed_agent":
+    case "stop_managed_agent":
+      // Host file-backed managed agents (snake_case RawManagedAgent).
+      return (await hostIpc(cmd, args)) as T;
+
+    case "list_personas":
+    case "create_persona":
+    case "update_persona":
+    case "set_persona_active":
+    case "delete_persona":
       return (await hostIpc(cmd, args)) as T;
 
     case "discover_acp_providers":
@@ -489,7 +511,6 @@ export async function invoke<T = unknown>(
       ] as unknown as T;
 
     case "list_teams":
-    case "list_personas":
     case "list_projects":
     case "list_community_members":
     case "list_custom_emojis":
