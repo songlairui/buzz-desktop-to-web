@@ -2332,6 +2332,190 @@ function ipcGetGlobalAgentConfig() {
 }
 
 /**
+ * Desktop `RuntimeConfigSurface` for AgentConfigPanel / ModelPicker.
+ * Web host has no ACP session cache file bridge — build a pre/post-spawn
+ * surface from the managed-agent record + global defaults so UI never gets
+ * `[]` (which crashes on `sources.configFilePath`).
+ */
+function configField(value, origin = "envVar") {
+  return {
+    value: value == null || value === "" ? null : String(value),
+    origin,
+    writeVia: { type: "readOnly" },
+    overriddenValue: null,
+    overriddenOrigin: null,
+    isRequired: false,
+  };
+}
+
+function runtimeMetaFromAgentCommand(agentCommand) {
+  const raw = String(agentCommand || "").trim();
+  const base = path.basename(raw).replace(/\.js$/i, "");
+  const table = {
+    grok: { id: "grok", label: "Grok Build", configFilePath: null },
+    goose: {
+      id: "goose",
+      label: "Goose",
+      configFilePath: "~/.config/goose/config.yaml",
+    },
+    "claude-agent-acp": {
+      id: "claude",
+      label: "Claude Code",
+      configFilePath: "~/.claude/settings.json",
+    },
+    claude: {
+      id: "claude",
+      label: "Claude Code",
+      configFilePath: "~/.claude/settings.json",
+    },
+    "codex-acp": {
+      id: "codex",
+      label: "Codex",
+      configFilePath: "~/.codex/config.toml",
+    },
+    codex: {
+      id: "codex",
+      label: "Codex",
+      configFilePath: "~/.codex/config.toml",
+    },
+    "pi-acp-wrapper": {
+      id: "pi-coding-agent",
+      label: "Pi Coding Agent",
+      configFilePath: "~/.pi/agent/settings.json",
+    },
+    "pi-coding-agent": {
+      id: "pi-coding-agent",
+      label: "Pi Coding Agent",
+      configFilePath: "~/.pi/agent/settings.json",
+    },
+    pi: {
+      id: "pi-coding-agent",
+      label: "Pi Coding Agent",
+      configFilePath: "~/.pi/agent/settings.json",
+    },
+    "buzz-acp": {
+      id: "buzz-agent",
+      label: "Buzz Agent",
+      configFilePath: null,
+    },
+    "buzz-agent": {
+      id: "buzz-agent",
+      label: "Buzz Agent",
+      configFilePath: null,
+    },
+  };
+  if (table[base]) return table[base];
+  if (table[raw]) return table[raw];
+  return {
+    id: base || raw || null,
+    label: base || raw || "Agent",
+    configFilePath: null,
+  };
+}
+
+function ipcGetAgentConfigSurface(args) {
+  const pubkey = String(args.pubkey || args.agentPubkey || "")
+    .trim()
+    .toLowerCase();
+  if (!pubkey || !HEX64.test(pubkey)) {
+    throw new Error("pubkey required");
+  }
+
+  const store = loadManagedAgentsStore();
+  let record = store.agents.find(
+    (a) => String(a.pubkey).toLowerCase() === pubkey,
+  );
+  if (record) {
+    record = syncManagedAgentRuntimeStatus(record);
+  }
+
+  // Allow host systemd Fedora-Agent if listed only via list overlay
+  if (!record) {
+    try {
+      const agentPk = getAgentPubkey();
+      if (String(agentPk).toLowerCase() === pubkey) {
+        const env = getEnvConfig();
+        record = {
+          pubkey: agentPk,
+          name: "Fedora-Agent",
+          agent_command: env.BUZZ_ACP_AGENT_COMMAND || "pi-acp-wrapper.js",
+          model: env.BUZZ_ACP_MODEL || env.GOOSE_MODEL || "grok-4.5",
+          provider: env.GOOSE_PROVIDER || "openai",
+          system_prompt: null,
+          status: getServiceStatus() === "running" ? "running" : "stopped",
+        };
+      }
+    } catch {
+      /* no agent key */
+    }
+  }
+  if (!record) throw new Error(`agent ${pubkey} not found`);
+
+  const globalCfg = loadGlobalAgentConfig();
+  const meta = runtimeMetaFromAgentCommand(record.agent_command);
+  const isRunning =
+    record.status === "running" &&
+    record.pid &&
+    isPidAlive(record.pid);
+  const isPreSpawn = !isRunning;
+
+  const model =
+    record.model || globalCfg.model || null;
+  const provider =
+    record.provider || globalCfg.provider || null;
+  const systemPrompt = record.system_prompt || null;
+
+  const modelOrigin = record.model
+    ? "envVar"
+    : globalCfg.model
+      ? "globalDefault"
+      : "envVar";
+  const providerOrigin = record.provider
+    ? "envVar"
+    : globalCfg.provider
+      ? "globalDefault"
+      : "envVar";
+
+  return {
+    runtimeId: meta.id,
+    runtimeLabel: meta.label,
+    isPreSpawn,
+    normalized: {
+      model: model != null ? configField(model, modelOrigin) : null,
+      provider: provider != null ? configField(provider, providerOrigin) : null,
+      mode: null,
+      thinkingEffort: null,
+      maxOutputTokens: null,
+      contextLimit: null,
+      systemPrompt:
+        systemPrompt != null
+          ? configField(systemPrompt, "personaDefault")
+          : null,
+    },
+    advanced: [],
+    extensions: [],
+    sources: {
+      acpNative: isPreSpawn ? "pending" : "available",
+      acpConfigOptions: isPreSpawn ? "pending" : "notApplicable",
+      envVars: "available",
+      configFile: meta.configFilePath ? "available" : "notApplicable",
+      configFilePath: meta.configFilePath,
+      mcpConfigFilePath: null,
+    },
+  };
+}
+
+/** No-op session cache write (desktop stores ACP session/new capture). */
+function ipcPutAgentSessionConfig(_args) {
+  return true;
+}
+
+/** Optional harness file-layer subset — web host does not parse goose/codex files. */
+function ipcGetRuntimeFileConfig(_args) {
+  return null;
+}
+
+/**
  * Persist global defaults. Restart of running agents is best-effort and
  * optional (web host does not auto-restart on every env tweak unless
  * preferred_runtime/model/provider changes and agents are running).
@@ -3806,6 +3990,15 @@ async function handleIpc(cmd, args = {}) {
 
     case "set_global_agent_config":
       return ipcSetGlobalAgentConfig(args);
+
+    case "get_agent_config_surface":
+      return ipcGetAgentConfigSurface(args);
+
+    case "put_agent_session_config":
+      return ipcPutAgentSessionConfig(args);
+
+    case "get_runtime_file_config":
+      return ipcGetRuntimeFileConfig(args);
 
     case "delete_managed_agent":
       return ipcDeleteManagedAgent(args);

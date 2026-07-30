@@ -305,6 +305,17 @@ export async function invoke<T = unknown>(
     case "set_global_agent_config":
       return (await hostIpc(cmd, args)) as T;
 
+    // Agent profile config panel — MUST be object with sources.configFilePath.
+    // Unknown-cmd fallback returns [] and crashes AgentConfigPanel.
+    case "get_agent_config_surface":
+      return (await hostIpc(cmd, args)) as T;
+
+    case "put_agent_session_config":
+      return (await hostIpc(cmd, args)) as T;
+
+    case "get_runtime_file_config":
+      return (await hostIpc(cmd, args)) as T;
+
     case "get_baked_build_env":
     case "get_baked_build_env_keys":
       return [] as unknown as T;
@@ -605,10 +616,34 @@ export async function invoke<T = unknown>(
       } else {
         return data as T;
       }
+    } else {
+      // Surface host 4xx/5xx instead of silently returning [] — that turns
+      // missing object-shaped IPCs into runtime crashes (e.g. .configFilePath).
+      const text = await res.text().catch(() => "");
+      let msg = `host ipc ${cmd} failed: HTTP ${res.status}`;
+      try {
+        const parsed = text ? JSON.parse(text) : null;
+        if (
+          parsed &&
+          typeof parsed === "object" &&
+          typeof (parsed as { error?: unknown }).error === "string"
+        ) {
+          msg = (parsed as { error: string }).error;
+        }
+      } catch {
+        /* ignore */
+      }
+      console.warn("[Web-Shim] unhandled IPC error", cmd, msg);
     }
   } catch (err) {
     // Ignore fetch errors
   }
 
+  // Last resort: empty array. Prefer explicit case handlers for object shapes.
+  console.warn(
+    "[Web-Shim] unhandled IPC falling back to []:",
+    cmd,
+    "(add an explicit host handler if this is an object-shaped command)",
+  );
   return [] as unknown as T;
 }
