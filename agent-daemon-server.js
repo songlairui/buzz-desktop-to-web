@@ -2089,6 +2089,16 @@ function ipcStartManagedAgent(args) {
     record.log_path || `/tmp/buzz-acp-${record.pubkey.slice(0, 12)}.log`;
   const logFd = fs.openSync(logPath, "a");
 
+  // Desktop passes multi-token harness args as ONE comma-joined env value:
+  //   BUZZ_ACP_AGENT_ARGS=agent,--always-approve,stdio
+  // buzz-acp clap uses value_delimiter=',' so that becomes 3 tokens for `grok`.
+  // NEVER expand as repeated `--agent-args X` on the CLI — a token starting
+  // with `--` (e.g. --always-approve) is parsed as a buzz-acp flag → exit 2.
+  const agentArgsJoined = agentArgs
+    .map((a) => String(a).trim())
+    .filter(Boolean)
+    .join(",");
+
   const childEnv = {
     ...process.env,
     PATH: hostSearchPath(),
@@ -2098,6 +2108,10 @@ function ipcStartManagedAgent(args) {
     BUZZ_ACP_AGENT_OWNER: ownerPk,
     BUZZ_ACP_RESPOND_TO: record.respond_to || "owner-only",
     BUZZ_ACP_AGENT_COMMAND: agentCommand,
+    // Empty string would fall back to clap default "acp" — only set when non-empty.
+    ...(agentArgsJoined
+      ? { BUZZ_ACP_AGENT_ARGS: agentArgsJoined }
+      : { BUZZ_ACP_AGENT_ARGS: "" }),
     OPENAI_BASE_URL: envFile.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL,
     OPENAI_API_KEY: envFile.OPENAI_API_KEY || process.env.OPENAI_API_KEY,
     BUZZ_ACP_MODEL: model,
@@ -2118,6 +2132,8 @@ function ipcStartManagedAgent(args) {
       record.respond_to_allowlist.join(",");
   }
 
+  // Prefer env for agent args (desktop parity). Only pass a single
+  // --agent-args when non-empty so clap does not re-split wrongly.
   const cliArgs = [
     "--private-key",
     record.seckey_hex,
@@ -2130,8 +2146,11 @@ function ipcStartManagedAgent(args) {
     "--respond-to",
     record.respond_to || "owner-only",
   ];
-  for (const a of agentArgs) {
-    cliArgs.push("--agent-args", String(a));
+  if (agentArgsJoined) {
+    cliArgs.push("--agent-args", agentArgsJoined);
+  } else {
+    // Explicit empty so clap default "acp" is not applied to pi-wrapper / buzz-agent.
+    cliArgs.push("--agent-args", "");
   }
   if (systemPrompt) {
     cliArgs.push("--system-prompt", systemPrompt);
@@ -2161,16 +2180,30 @@ function ipcStartManagedAgent(args) {
         (a) => String(a.pubkey).toLowerCase() === pubkey,
       );
       if (i >= 0 && s.agents[i].pid === child.pid) {
+        let lastError = null;
+        if (code && code !== 0) {
+          // Surface log tail so UI "details" / last_error is actionable.
+          let tail = "";
+          try {
+            if (fs.existsSync(logPath)) {
+              const raw = fs.readFileSync(logPath, "utf8");
+              const lines = raw.split("\n").filter(Boolean);
+              tail = lines.slice(-6).join(" | ").slice(0, 400);
+            }
+          } catch {
+            /* ignore */
+          }
+          lastError = tail
+            ? `buzz-acp exited code=${code}: ${tail}`
+            : `buzz-acp exited code=${code} signal=${signal || ""}`;
+        }
         s.agents[i] = {
           ...s.agents[i],
           status: "stopped",
           pid: null,
           last_stopped_at: isoNow(),
           last_exit_code: code,
-          last_error:
-            code && code !== 0
-              ? `buzz-acp exited code=${code} signal=${signal || ""}`
-              : null,
+          last_error: lastError,
           updated_at: isoNow(),
         };
         saveManagedAgentsStore(s);
@@ -2211,6 +2244,53 @@ function ipcStartManagedAgent(args) {
     `[start_managed_agent] ${record.name} pid=${child.pid} cmd=${agentCommand} log=${logPath}`,
   );
   return managedAgentSummary(record);
+}
+
+/**
+ * Tail managed-agent log for the profile "details" panel.
+ * Desktop: get_managed_agent_log → { content, log_path }.
+ */
+function ipcGetManagedAgentLog(args) {
+  const pubkey = String(args.pubkey || args.agentPubkey || "")
+    .trim()
+    .toLowerCase();
+  if (!pubkey) throw new Error("pubkey required");
+  const lineCount = Math.min(
+    Math.max(Number(args.lineCount ?? args.line_count ?? 120) || 120, 1),
+    2000,
+  );
+
+  const store = loadManagedAgentsStore();
+  const record = store.agents.find(
+    (a) => String(a.pubkey).toLowerCase() === pubkey,
+  );
+  if (!record) throw new Error(`agent ${pubkey} not found`);
+  if (record.backend && record.backend.type && record.backend.type !== "local") {
+    throw new Error("logs are not available for remote agents");
+  }
+
+  const logPath =
+    record.log_path || `/tmp/buzz-acp-${record.pubkey.slice(0, 12)}.log`;
+  let content = "";
+  try {
+    if (fs.existsSync(logPath)) {
+      const raw = fs.readFileSync(logPath, "utf8");
+      const lines = raw.split("\n");
+      content = lines.slice(-lineCount).join("\n");
+      // Cap payload size for browser IPC.
+      if (content.length > 200_000) {
+        content = content.slice(-200_000);
+      }
+    } else {
+      content = `(no log file yet: ${logPath})\n`;
+      if (record.last_error) {
+        content += `last_error: ${record.last_error}\n`;
+      }
+    }
+  } catch (err) {
+    content = `failed to read log: ${err.message}\n`;
+  }
+  return { content, log_path: logPath };
 }
 
 function ipcStopManagedAgent(args) {
@@ -4781,6 +4861,9 @@ async function handleIpc(cmd, args = {}) {
 
     case "stop_managed_agent":
       return ipcStopManagedAgent(args);
+
+    case "get_managed_agent_log":
+      return ipcGetManagedAgentLog(args);
 
     case "update_profile":
       return await ipcUpdateProfile(args);

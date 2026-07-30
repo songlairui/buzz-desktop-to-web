@@ -470,6 +470,7 @@ export async function invoke<T = unknown>(
     case "delete_managed_agent":
     case "start_managed_agent":
     case "stop_managed_agent":
+    case "get_managed_agent_log":
       // Host file-backed managed agents (snake_case RawManagedAgent).
       return (await hostIpc(cmd, args)) as T;
 
