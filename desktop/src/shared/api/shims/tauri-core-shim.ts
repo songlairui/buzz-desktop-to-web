@@ -299,25 +299,11 @@ export async function invoke<T = unknown>(
         next_cursor: null,
       } as unknown as T;
 
+    // Settings → Agents defaults. Must hit host so preferred_runtime (e.g. grok)
+    // persists across refresh — never hardcode pi-coding-agent.
     case "get_global_agent_config":
-      return {
-        provider: null,
-        model: null,
-        preferred_runtime: "pi-coding-agent",
-        env_vars: {},
-      } as unknown as T;
-
     case "set_global_agent_config":
-      return {
-        config: (args.config as Record<string, unknown>) || {
-          provider: null,
-          model: null,
-          preferred_runtime: "pi-coding-agent",
-          env_vars: {},
-        },
-        restarted_count: 0,
-        failed_restart_count: 0,
-      } as unknown as T;
+      return (await hostIpc(cmd, args)) as T;
 
     case "get_baked_build_env":
     case "get_baked_build_env_keys":

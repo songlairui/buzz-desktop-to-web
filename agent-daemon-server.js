@@ -51,6 +51,10 @@ const PERSONAS_JSON_PATH =
 const MANAGED_AGENTS_JSON_PATH =
   process.env.BUZZ_WEB_MANAGED_AGENTS_FILE ||
   path.join(WEB_CONFIG_DIR, "managed-agents.json");
+/** Desktop-parity: Settings → Agents default runtime/provider/model/env. */
+const GLOBAL_AGENT_CONFIG_PATH =
+  process.env.BUZZ_WEB_GLOBAL_AGENT_CONFIG_FILE ||
+  path.join(WEB_CONFIG_DIR, "global-agent-config.json");
 
 const FIZZ_SYSTEM_PROMPT =
   "You are Fizz, an energetic maker who turns ideas into action. Be upbeat, practical, and decisive. Help users plan, create, solve problems, and finish work. Add occasional bee wordplay or 🐝✨—keep it charming, never distracting.";
@@ -2178,6 +2182,122 @@ async function ipcUpdateProfile(args) {
   return ipcGetProfile(hostPubkey());
 }
 
+// ── Global agent defaults (Settings → Agents) ───────────────────────────────
+// Desktop stores this under app-data as global-agent-config.json. Web host
+// persists under ~/.config/buzz-web so preferred_runtime (e.g. "grok") survives
+// refresh — the old shim returned a hardcoded pi-coding-agent and discarded saves.
+
+const EMPTY_GLOBAL_AGENT_CONFIG = {
+  env_vars: {},
+  provider: null,
+  model: null,
+  preferred_runtime: null,
+};
+
+function normalizeGlobalAgentConfig(raw) {
+  const src = raw && typeof raw === "object" ? raw : {};
+  const envIn =
+    src.env_vars && typeof src.env_vars === "object" && !Array.isArray(src.env_vars)
+      ? src.env_vars
+      : src.envVars && typeof src.envVars === "object" && !Array.isArray(src.envVars)
+        ? src.envVars
+        : {};
+  const env_vars = {};
+  for (const [k, v] of Object.entries(envIn)) {
+    if (typeof k !== "string" || !k.trim()) continue;
+    // Empty value = "inherit" — strip on write (desktop parity).
+    if (v == null || v === "") continue;
+    env_vars[k] = String(v);
+  }
+  const blankToNull = (v) => {
+    if (v == null) return null;
+    const s = String(v).trim();
+    return s ? s : null;
+  };
+  return {
+    env_vars,
+    provider: blankToNull(src.provider),
+    model: blankToNull(src.model),
+    preferred_runtime: blankToNull(
+      src.preferred_runtime ?? src.preferredRuntime ?? null,
+    ),
+  };
+}
+
+function loadGlobalAgentConfig() {
+  try {
+    if (!fs.existsSync(GLOBAL_AGENT_CONFIG_PATH)) {
+      return { ...EMPTY_GLOBAL_AGENT_CONFIG, env_vars: {} };
+    }
+    const raw = JSON.parse(fs.readFileSync(GLOBAL_AGENT_CONFIG_PATH, "utf8"));
+    return normalizeGlobalAgentConfig(raw);
+  } catch (err) {
+    console.warn(
+      "[global-agent-config] load failed:",
+      err && err.message ? err.message : err,
+    );
+    return { ...EMPTY_GLOBAL_AGENT_CONFIG, env_vars: {} };
+  }
+}
+
+function saveGlobalAgentConfigFile(config) {
+  fs.mkdirSync(WEB_CONFIG_DIR, { recursive: true, mode: 0o700 });
+  const tmp = `${GLOBAL_AGENT_CONFIG_PATH}.${process.pid}.tmp`;
+  const body = JSON.stringify(config, null, 2);
+  fs.writeFileSync(tmp, body, { mode: 0o600 });
+  fs.renameSync(tmp, GLOBAL_AGENT_CONFIG_PATH);
+  try {
+    fs.chmodSync(GLOBAL_AGENT_CONFIG_PATH, 0o600);
+  } catch {
+    /* ignore */
+  }
+}
+
+function ipcGetGlobalAgentConfig() {
+  return loadGlobalAgentConfig();
+}
+
+/**
+ * Persist global defaults. Restart of running agents is best-effort and
+ * optional (web host does not auto-restart on every env tweak unless
+ * preferred_runtime/model/provider changes and agents are running).
+ *
+ * Args: { config: GlobalAgentConfig } (Tauri shape).
+ */
+function ipcSetGlobalAgentConfig(args) {
+  const input =
+    args && args.config && typeof args.config === "object"
+      ? args.config
+      : args && typeof args === "object"
+        ? args
+        : {};
+  const next = normalizeGlobalAgentConfig(input);
+  // Light validation: env keys must look like shell identifiers.
+  for (const key of Object.keys(next.env_vars)) {
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      throw new Error(`invalid env var key: ${key}`);
+    }
+    if (
+      /^(GOOSE_PROVIDER|GOOSE_MODEL|BUZZ_ACP_MODEL|BUZZ_AGENT_MODEL|BUZZ_AGENT_PROVIDER)$/i.test(
+        key,
+      )
+    ) {
+      throw new Error(
+        `key ${key} must be set via structured provider/model fields, not env_vars`,
+      );
+    }
+  }
+  saveGlobalAgentConfigFile(next);
+  const saved = loadGlobalAgentConfig();
+  // Restart counts: web host leaves agents running; UI only needs honest counts.
+  // (Desktop restarts when effective env changes — optional enhancement.)
+  return {
+    config: saved,
+    restarted_count: 0,
+    failed_restart_count: 0,
+  };
+}
+
 /** NIP-44 encrypt/decrypt to self (read-state snapshots). */
 function ipcNip44EncryptToSelf(args) {
   const plaintext = args.plaintext ?? args.input?.plaintext;
@@ -3606,6 +3726,12 @@ async function handleIpc(cmd, args = {}) {
 
     case "update_managed_agent":
       return ipcUpdateManagedAgent(args);
+
+    case "get_global_agent_config":
+      return ipcGetGlobalAgentConfig();
+
+    case "set_global_agent_config":
+      return ipcSetGlobalAgentConfig(args);
 
     case "delete_managed_agent":
       return ipcDeleteManagedAgent(args);
