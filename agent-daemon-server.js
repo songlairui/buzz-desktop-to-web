@@ -1515,9 +1515,40 @@ function managedAgentSummary(record) {
 /**
  * Desktop-style managed agent list for path-3 web.
  * File-backed records + optional legacy host buzz-agent unit.
+ *
+ * Always re-sync runtime status from live PIDs (desktop list_managed_agents
+ * parity). Without this, a dead process can stay "running" forever, and a
+ * process started outside the current in-memory map can look "stopped" to
+ * the Activity pane (which gates the observer feed on status).
  */
 function ipcListManagedAgents() {
   const store = loadManagedAgentsStore();
+  let dirty = false;
+  for (let i = 0; i < store.agents.length; i++) {
+    const before = store.agents[i];
+    const synced = syncManagedAgentRuntimeStatus({ ...before });
+    if (
+      synced.status !== before.status ||
+      synced.pid !== before.pid ||
+      synced.last_stopped_at !== before.last_stopped_at
+    ) {
+      store.agents[i] = { ...synced, updated_at: isoNow() };
+      dirty = true;
+    } else {
+      store.agents[i] = synced;
+    }
+  }
+  if (dirty) {
+    try {
+      saveManagedAgentsStore(store);
+    } catch (err) {
+      console.warn(
+        "list_managed_agents status sync save failed:",
+        err instanceof Error ? err.message : err,
+      );
+    }
+  }
+
   const list = store.agents.map(managedAgentSummary);
 
   // Optional: surface the host systemd buzz-agent unit when running.

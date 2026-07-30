@@ -347,14 +347,24 @@ export function useManagedAgentsQuery(options?: { enabled?: boolean }) {
     staleTime: 5_000,
     refetchInterval: (query) => {
       const agents = query.state.data as ManagedAgent[] | undefined;
-      // Only local "running" agents need polling: process state can change
-      // with no relay event to signal it, so this poll is the only liveness
-      // path for them. When nothing is running there IS an event path —
-      // `agents-data-changed` (control-plane changes) — so the idle branch
-      // drops its poll entirely rather than falling back to 30s.
+      // Local process liveness has no reliable push path on the web host:
+      // `agents-data-changed` is a Tauri desktop event and is not emitted by
+      // agent-daemon-server. If we only poll while something is already
+      // "running", a page that first loaded while agents were stopped (or a
+      // daemon restart that auto-spawned them after the first fetch) never
+      // learns status flipped to running — Activity then shows
+      // "Observer not attached" forever even though buzz-acp is up.
+      //
+      // Always poll local agents. Keep the interval short when anything is
+      // running (exit detection); slower when all idle so we still catch
+      // external / daemon-side starts without hammering IPC.
+      const hasLocal = agents?.some((agent) => agent.backend?.type === "local");
+      if (!hasLocal && agents !== undefined) {
+        return false;
+      }
       return agents?.some((agent) => agent.status === "running")
         ? 5_000
-        : false;
+        : 10_000;
     },
   });
 }
