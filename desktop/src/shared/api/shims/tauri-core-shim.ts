@@ -179,7 +179,25 @@ export async function invoke<T = unknown>(
       const id = nextWsId++;
       try {
         const ws = new WebSocket(url);
+        // Queue outbound frames until OPEN — relay AUTH/REQ often fire right
+        // after connect returns, before the TCP handshake finishes. Dropping
+        // them silently leaves the UI "connected" with empty live feeds
+        // (including kind:24200 observer Activity).
+        const pending: string[] = [];
+        (ws as WebSocket & { __pending?: string[] }).__pending = pending;
         wsSockets.set(id, ws);
+        ws.onopen = () => {
+          const q =
+            (ws as WebSocket & { __pending?: string[] }).__pending || [];
+          (ws as WebSocket & { __pending?: string[] }).__pending = undefined;
+          for (const frame of q) {
+            try {
+              ws.send(frame);
+            } catch (err) {
+              console.warn("[Web-Shim WS] flush pending failed", err);
+            }
+          }
+        };
         ws.onmessage = (event) => {
           if (onMessageChannel) {
             onMessageChannel.send({ type: "Text", data: event.data });
@@ -201,14 +219,25 @@ export async function invoke<T = unknown>(
       const id = (args.id as number) || (args.wsId as number);
       const message = args.message as any;
       const ws = wsSockets.get(id);
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        const payload =
-          typeof message === "string"
-            ? message
-            : message?.data
+      if (!ws) return true as unknown as T;
+      const payload =
+        typeof message === "string"
+          ? message
+          : message?.data
             ? message.data
             : JSON.stringify(message);
+      if (ws.readyState === WebSocket.OPEN) {
         ws.send(payload);
+      } else if (ws.readyState === WebSocket.CONNECTING) {
+        const pending =
+          (ws as WebSocket & { __pending?: string[] }).__pending || [];
+        pending.push(payload);
+        (ws as WebSocket & { __pending?: string[] }).__pending = pending;
+      } else {
+        console.warn(
+          "[Web-Shim WS] send ignored; socket not open",
+          ws.readyState,
+        );
       }
       return true as unknown as T;
     }

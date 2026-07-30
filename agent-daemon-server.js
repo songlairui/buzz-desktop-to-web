@@ -2112,6 +2112,9 @@ function ipcStartManagedAgent(args) {
     ...(agentArgsJoined
       ? { BUZZ_ACP_AGENT_ARGS: agentArgsJoined }
       : { BUZZ_ACP_AGENT_ARGS: "" }),
+    // Desktop always enables relay observer (kind 24200 telemetry). Without this
+    // the agent replies in-channel but Activity panel stays empty forever.
+    BUZZ_ACP_RELAY_OBSERVER: "true",
     OPENAI_BASE_URL: envFile.OPENAI_BASE_URL || process.env.OPENAI_BASE_URL,
     OPENAI_API_KEY: envFile.OPENAI_API_KEY || process.env.OPENAI_API_KEY,
     BUZZ_ACP_MODEL: model,
@@ -2145,6 +2148,8 @@ function ipcStartManagedAgent(args) {
     agentCommand,
     "--respond-to",
     record.respond_to || "owner-only",
+    // Required for Activity pane: publish encrypted kind:24200 frames to owner.
+    "--relay-observer",
   ];
   if (agentArgsJoined) {
     cliArgs.push("--agent-args", agentArgsJoined);
