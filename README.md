@@ -1,3 +1,44 @@
+# buzz-desktop-to-web
+
+**Buzz Desktop → Web 控制台** 的持续 fork。
+
+把 [Buzz](https://github.com/block/buzz) 的 Desktop 体验搬到浏览器里跑：同一套 Desktop UI / agent 能力，由本机（或内网主机）上的 **web-host** 托管，而不是 Tauri 桌面壳。
+
+> [!WARNING]
+> **仅限可信私有网络使用。**
+>
+> 本 fork 的 web-host 面向内网 / VPN / 本机回环等**可信环境**。它不是面向公网的多租户 SaaS 控制台。
+> 不要直接暴露到公网，不要在不可信网络上依赖其鉴权与边界。密钥、agent 进程、本地文件系统与 relay 能力都在 host 侧；公网暴露等于把工作区权限敞开。
+
+## 这个仓库是什么
+
+| | |
+|---|---|
+| **上游** | [`block/buzz`](https://github.com/block/buzz)（公开 fork，保留 fork 关系） |
+| **本仓目标** | Desktop → Web：host-held web client + agent-daemon / IPC 桥，使浏览器可用 Buzz Desktop 工作流 |
+| **同步策略** | **持续 rebase 上游**。本仓在 upstream `main` 之上叠 web-host 相关提交；会定期把上游变更 rebase 进来，历史可能重写。请以本仓 `main` 为工作基线，不要假设 commit hash 长期稳定 |
+| **可见性** | 公开仓库；**部署与使用仍应只在可信私有网络** |
+
+### 和上游的关系
+
+- 这是 **fork**，不是无关镜像：可从 GitHub 看到 parent = `block/buzz`。
+- 我们**不**长期维护与上游分叉的并行历史；默认做法是 **rebase onto upstream**，尽量保持 web-host 补丁可搬迁。
+- 上游功能、协议与产品叙事仍以 upstream README / docs 为准；下文保留上游说明作参考。
+
+### 你大概会怎么用
+
+1. 在可信主机上构建 / 运行 web-host（内网或本机）。
+2. 浏览器打开 host 提供的控制台 URL（例如内网域名）。
+3. 在 host 侧连 relay、起 managed agents、看 Activity / 线程等 Desktop 能力。
+
+安全默认假设：**host 与客户端都在你控制的信任边界内**。
+
+---
+
+# Upstream: Buzz
+
+> 以下内容来自上游项目说明，便于对照产品与架构。本 fork 的部署边界以上方警告为准。
+
 <h1 align="center">Buzz 🐝</h1>
 
 <p align="center">
